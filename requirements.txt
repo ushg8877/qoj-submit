@@ -1,0 +1,7 @@
+# 弹出登录窗口（推荐，Windows 已有 Chrome/Edge 即可）
+selenium>=4.18
+
+# 备选
+# playwright>=1.40
+# 然后执行: playwright install chromium
+# pywebview>=4.4

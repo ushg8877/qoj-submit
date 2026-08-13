@@ -1,0 +1,3378 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""XCPC-style command-line submit plugin for QOJ (qoj.ac) VP contests.
+
+Usage during a contest:
+  ./submit a.cpp      submit problem A
+  ./submit b.cpp      submit problem B
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import getpass
+import gzip
+import hashlib
+import hmac
+import html as htmlmod
+import http.client
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import sqlite3
+import ssl
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from http.client import HTTPMessage, IncompleteRead, RemoteDisconnected
+from http.cookies import SimpleCookie
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.error import URLError
+from urllib.parse import urlencode, urljoin, urlparse, urlunparse
+from urllib.request import urlopen
+
+
+def _venv_python_candidates() -> List[Path]:
+    bin_dir = "Scripts" if os.name == "nt" else "bin"
+    names = ("python.exe", "python") if os.name == "nt" else ("python", "python3")
+    roots: List[Path] = []
+    env = os.environ.get("QOJ_SUBMIT_VENV")
+    if env:
+        roots.append(Path(env))
+    data = os.environ.get("XDG_DATA_HOME")
+    if data:
+        roots.append(Path(data) / "qoj-xcpc" / "venv")
+    else:
+        roots.append(Path.home() / ".local" / "share" / "qoj-xcpc" / "venv")
+    roots.append(Path(__file__).resolve().parent / ".venv")
+    found: List[Path] = []
+    for root in roots:
+        for name in names:
+            found.append(root / bin_dir / name)
+    return found
+
+
+def _maybe_reexec_venv() -> None:
+    if os.environ.get("QOJ_SUBMIT_NOVENV"):
+        return
+    try:
+        current = Path(sys.executable).resolve()
+    except OSError:
+        current = Path(sys.executable)
+    for venv_py in _venv_python_candidates():
+        if not venv_py.is_file():
+            continue
+        try:
+            if venv_py.resolve() == current:
+                return
+        except OSError:
+            continue
+        os.execv(str(venv_py), [str(venv_py), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+_maybe_reexec_venv()
+
+VERSION = "1.0.0"
+APP_NAME = "qoj-xcpc"
+DEFAULT_SITE = "https://qoj.ac"
+CONTEST_FILE = ".qoj.json"
+DEFAULT_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+EXT_CANDIDATES = [
+    ".cpp",
+    ".cc",
+    ".cxx",
+    ".c",
+    ".py",
+    ".java",
+    ".rs",
+    ".go",
+    ".kt",
+    ".pas",
+    ".d",
+    ".rb",
+    ".hs",
+]
+
+# Preferred language tokens (normalized) by file suffix.
+EXT_LANG_PREFER = {
+    ".cpp": ["c++20", "c++23", "c++17", "c++14", "c++11", "c++26", "c++98", "c++"],
+    ".cc": ["c++20", "c++23", "c++17", "c++14", "c++11", "c++26", "c++98", "c++"],
+    ".cxx": ["c++20", "c++23", "c++17", "c++14", "c++11", "c++26", "c++98", "c++"],
+    ".c++": ["c++20", "c++23", "c++17", "c++14", "c++11", "c++26", "c++98", "c++"],
+    ".c": ["c11", "c99", "c"],
+    ".py": ["pypy3", "pypy", "cpython", "python3", "python"],
+    ".java": ["java21", "java17", "java11", "java8", "java"],
+    ".rs": ["rust"],
+    ".go": ["go"],
+    ".kt": ["kotlin"],
+    ".pas": ["pascal"],
+    ".d": ["d"],
+    ".rb": ["ruby"],
+    ".hs": ["haskell"],
+}
+
+# QOJ judge language values (same as the working hikariyo gist).
+DEFAULT_QOJ_LANGS = [
+    ("C++20", "C++ 20"),
+    ("C++23", "C++ 23"),
+    ("C++17", "C++ 17"),
+    ("C++14", "C++ 14"),
+    ("C++11", "C++ 11"),
+    ("C++26", "C++ 26"),
+    ("C++98", "C++ 98"),
+    ("C11", "C 11"),
+    ("C99", "C 99"),
+    ("PyPy3", "Python 3 (PyPy 3.11)"),
+    ("Python3", "Python 3 (CPython 3.13)"),
+    ("Java21", "Java 21"),
+    ("Java17", "Java 17"),
+    ("Java11", "Java 11"),
+    ("Java8", "Java 8"),
+    ("Rust", "Rust"),
+    ("Go", "Go"),
+    ("Kotlin", "Kotlin"),
+    ("Pascal", "Pascal"),
+    ("D", "D"),
+    ("Ruby", "Ruby"),
+    ("Haskell", "Haskell"),
+]
+
+FINAL_VERDICTS = {
+    "accepted",
+    "wrong answer",
+    "compile error",
+    "compilation error",
+    "time limit exceeded",
+    "memory limit exceeded",
+    "output limit exceeded",
+    "runtime error",
+    "dangerous syscall",
+    "restricted function",
+    "system error",
+    "judgment failed",
+    "no output",
+    "partially correct",
+    "point",
+    "ac",
+    "wa",
+    "tle",
+    "mle",
+    "re",
+    "ce",
+    "ole",
+    "ok",
+    "编译错误",
+    "答案错误",
+    "时间超限",
+    "内存超限",
+    "运行错误",
+    "输出超限",
+    "正确",
+}
+
+PENDING_HINTS = (
+    "waiting",
+    "judging",
+    "pending",
+    "compiling",
+    "queue",
+    "等待",
+    "评测",
+    "编译中",
+    "排队",
+)
+
+CPP_TEMPLATE = """#include <bits/stdc++.h>
+using namespace std;
+
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    return 0;
+}
+"""
+
+
+def color_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return sys.stdout.isatty()
+
+
+def paint(text: str, code: str) -> str:
+    if not color_enabled():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def info(msg: str) -> None:
+    print(paint("[i] ", "36") + msg, flush=True)
+
+
+def ok(msg: str) -> None:
+    print(paint("[ok] ", "32") + msg, flush=True)
+
+
+def warn(msg: str) -> None:
+    print(paint("[!] ", "33") + msg, flush=True)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(paint("[x] ", "31") + msg, file=sys.stderr, flush=True)
+    raise SystemExit(code)
+
+
+def verdict_color(text: str) -> str:
+    low = text.lower()
+    if any(x in low for x in ("accepted", "正确", "ac")) and "not" not in low:
+        return paint(text, "32;1")
+    if any(x in low for x in ("waiting", "judging", "pending", "等待", "评测", "排队")):
+        return paint(text, "33")
+    return paint(text, "31")
+
+
+def xdg_config_dir() -> Path:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / APP_NAME
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return Path(xdg) / APP_NAME
+    return Path.home() / ".config" / APP_NAME
+
+
+def global_config_path() -> Path:
+    return xdg_config_dir() / "config.json"
+
+
+def find_contest_file(start: Optional[Path] = None) -> Optional[Path]:
+    cur = (start or Path.cwd()).resolve()
+    for path in [cur, *cur.parents]:
+        candidate = path / CONTEST_FILE
+        if candidate.is_file():
+            return candidate
+        if path.parent == path:
+            break
+    return None
+
+
+def load_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        die(f"找不到配置文件: {path}")
+    except json.JSONDecodeError as exc:
+        die(f"配置文件不是合法 JSON: {path} ({exc})")
+    return {}
+
+
+def save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def load_global() -> dict:
+    path = global_config_path()
+    if not path.is_file():
+        return {}
+    return load_json(path)
+
+
+def save_global(data: dict) -> None:
+    save_json(global_config_path(), data)
+
+
+def strip_html(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = htmlmod.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def norm_lang(text: str) -> str:
+    text = htmlmod.unescape(text).lower()
+    text = re.sub(r"\([^)]*\)", "", text)
+    return re.sub(r"[^a-z0-9+]+", "", text)
+
+
+def parse_cookie_input(raw: str) -> str:
+    """Accept a Cookie header, or a JSON object (including 请求 Cookie)."""
+    text = (raw or "").strip()
+    if text.lower().startswith("cookie:"):
+        text = text.split(":", 1)[1].strip()
+    if not text:
+        return ""
+    if text[0] in "{[":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            die(f"Cookie JSON 解析失败: {exc}")
+        if isinstance(data, dict) and len(data) == 1:
+            only = next(iter(data.values()))
+            if isinstance(only, dict) and any(
+                k in only for k in ("UOJSESSID", "cf_clearance", "uoj_username")
+            ):
+                data = only
+        if not isinstance(data, dict):
+            die("Cookie JSON 需要是对象，例如 {\"UOJSESSID\": \"...\"}")
+        skip = {"请求 cookie", "request cookie", "cookie"}
+        pairs = []
+        for key, value in data.items():
+            if str(key).strip().lower() in skip:
+                continue
+            if value is None or isinstance(value, (dict, list)):
+                continue
+            pairs.append(f"{key}={value}")
+        if not pairs:
+            die("Cookie JSON 里没有 UOJSESSID / cf_clearance 等字段")
+        return "; ".join(pairs)
+    return text
+
+
+def cookie_names(header: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for part in header.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        out[name.strip()] = value.strip()
+    return out
+
+
+def _network_error_kind(exc: BaseException) -> str:
+    parts = [str(exc)]
+    reason = getattr(exc, "reason", None)
+    if reason is not None:
+        parts.append(str(reason))
+    text = " ".join(parts).lower()
+    if "handshake" in text:
+        return "handshake"
+    if isinstance(exc, ssl.SSLError) or isinstance(reason, ssl.SSLError):
+        return "handshake"
+    if "ssl" in text and ("timed out" in text or "timeout" in text):
+        return "handshake"
+    if any(
+        s in text
+        for s in (
+            "timed out",
+            "timeout",
+            "deadline",
+            "temporarily",
+            "connection reset",
+            "connection aborted",
+            "broken pipe",
+            "unreachable",
+        )
+    ):
+        return "timeout"
+    return "other"
+
+
+class Client:
+    def __init__(self, site: str, cookie: str = "", user_agent: str = DEFAULT_UA, debug: bool = False):
+        self.site = site.rstrip("/")
+        self.user_agent = user_agent or DEFAULT_UA
+        self.debug = debug
+        self.cookies: Dict[str, str] = {}
+        self._conn: Optional[http.client.HTTPSConnection] = None
+        self._conn_host = ""
+        self._rebuild_opener()
+        if cookie:
+            self.set_cookie_header(cookie)
+
+    def _rebuild_opener(self) -> None:
+        self._drop_conn()
+        self._ssl_ctx = ssl.create_default_context()
+
+    def _drop_conn(self) -> None:
+        conn = getattr(self, "_conn", None)
+        self._conn = None
+        self._conn_host = ""
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _connection(self, parsed, timeout: float) -> http.client.HTTPSConnection:
+        host = parsed.hostname or "qoj.ac"
+        port = parsed.port or 443
+        key = f"{host}:{port}"
+        if self._conn is not None and self._conn_host == key:
+            self._conn.timeout = timeout
+            if getattr(self._conn, "sock", None) is not None:
+                try:
+                    self._conn.sock.settimeout(timeout)
+                except Exception:
+                    pass
+            return self._conn
+        self._drop_conn()
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=self._ssl_ctx)
+        self._conn = conn
+        self._conn_host = key
+        return conn
+
+    def set_cookie_header(self, header: str) -> None:
+        header = parse_cookie_input(header)
+        self.cookies.update(cookie_names(header))
+
+    def cookie_header(self) -> str:
+        return "; ".join(f"{k}={v}" for k, v in self.cookies.items() if k)
+
+    def _absorb_set_cookie(self, headers) -> None:
+        raw_list = headers.get_all("Set-Cookie") if hasattr(headers, "get_all") else []
+        if not raw_list:
+            single = headers.get("Set-Cookie")
+            raw_list = [single] if single else []
+        for item in raw_list:
+            jar = SimpleCookie()
+            try:
+                jar.load(item)
+            except Exception:
+                continue
+            for name, morsel in jar.items():
+                if morsel.value:
+                    self.cookies[name] = morsel.value
+
+    @staticmethod
+    def _read_body(fp, limit: int = 8 * 1024 * 1024, deadline: Optional[float] = None) -> bytes:
+        chunks: List[bytes] = []
+        n = 0
+        while n < limit:
+            if deadline is not None and time.time() > deadline:
+                raise TimeoutError("read deadline")
+            piece = fp.read(min(65536, limit - n))
+            if not piece:
+                break
+            chunks.append(piece)
+            n += len(piece)
+        return b"".join(chunks)
+
+    def _http_once(
+        self,
+        url: str,
+        data: Optional[bytes],
+        extra_headers: Optional[dict],
+        method: str,
+        sock_timeout: float,
+        read_timeout: float,
+    ) -> Tuple[int, str, bytes, str]:
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        hdrs = {
+            "Host": parsed.netloc,
+            "User-Agent": self.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip",
+            "Connection": "keep-alive",
+        }
+        cookie = self.cookie_header()
+        if cookie:
+            hdrs["Cookie"] = cookie
+        if extra_headers:
+            hdrs.update(extra_headers)
+            if cookie and "Cookie" not in extra_headers:
+                hdrs["Cookie"] = cookie
+        last_err: Optional[BaseException] = None
+        for reconnect in range(2):
+            conn = self._connection(parsed, sock_timeout)
+            try:
+                conn.request(method, path, body=data, headers=hdrs)
+                resp = conn.getresponse()
+                status = resp.status
+                loc = resp.getheader("Location") or ""
+                ctype = resp.getheader("Content-Type") or ""
+                cenc = (resp.getheader("Content-Encoding") or "").lower()
+                self._absorb_set_cookie(resp.headers)
+                raw = self._read_body(resp, deadline=time.time() + read_timeout)
+                if cenc == "gzip" and raw:
+                    try:
+                        raw = gzip.decompress(raw)
+                    except Exception:
+                        pass
+                charset = "utf-8"
+                m = re.search(r"charset=([^\s;]+)", ctype, re.I)
+                if m:
+                    charset = m.group(1).strip().strip('"')
+                return status, loc, raw, charset
+            except (BrokenPipeError, ConnectionResetError, RemoteDisconnected) as exc:
+                last_err = exc
+                self._drop_conn()
+                if reconnect == 0:
+                    continue
+                raise
+            except (ssl.SSLError, TimeoutError, socket.timeout, OSError):
+                self._drop_conn()
+                raise
+        raise last_err or OSError("connection failed")
+
+    def _request(
+        self,
+        url: str,
+        data: Optional[bytes] = None,
+        headers: Optional[dict] = None,
+        method: Optional[str] = None,
+        timeout: int = 25,
+        retries: int = 1,
+        fatal: bool = True,
+    ) -> Tuple[int, str, str]:
+        if not url.startswith("http"):
+            url = urljoin(self.site + "/", url.lstrip("/"))
+        attempts = max(1, retries + 1)
+        last_err: Optional[BaseException] = None
+        is_post = data is not None
+        method = (method or ("POST" if is_post else "GET")).upper()
+        sock_timeout = 20 if is_post else 15
+        current = url
+        send_data = data
+        send_method = method
+        send_post = is_post
+        for attempt in range(attempts):
+            if self.debug:
+                print(f"DEBUG {send_method} {current} (try {attempt + 1}/{attempts})", file=sys.stderr)
+            read_timeout = 8 if send_post else max(10, timeout)
+            redirects = 0
+            try:
+                while True:
+                    status, loc, raw, encoding = self._http_once(
+                        current, send_data, headers, send_method, sock_timeout, read_timeout
+                    )
+                    if loc:
+                        loc = urljoin(current, loc)
+                    if status in (301, 302, 303, 307, 308) and loc:
+                        if send_post:
+                            try:
+                                text = raw.decode(encoding, errors="replace")
+                            except LookupError:
+                                text = raw.decode("utf-8", errors="replace")
+                            return status, loc, text
+                        if redirects >= 5:
+                            break
+                        current = loc
+                        send_method = "GET"
+                        send_data = None
+                        send_post = False
+                        redirects += 1
+                        continue
+                    break
+                try:
+                    text = raw.decode(encoding, errors="replace")
+                except LookupError:
+                    text = raw.decode("utf-8", errors="replace")
+                if _is_cloudflare_block(text):
+                    die(
+                        "被 Cloudflare 拦截。请重新执行 ./submit login"
+                        "（必须用弹出的 Firefox 过验证，不要用自动化窗口）"
+                    )
+                return status, current, text
+            except (ssl.SSLError, TimeoutError, IncompleteRead, socket.timeout, URLError, OSError) as exc:
+                last_err = exc
+                kind = _network_error_kind(exc)
+                handshake_ok = kind == "handshake"
+                can_retry = attempt + 1 < attempts and (
+                    handshake_ok or (not send_post and kind in ("handshake", "timeout"))
+                )
+                if can_retry:
+                    if handshake_ok:
+                        info(f"TLS 握手超时，正在重试 ({attempt + 2}/{attempts})...")
+                    self._rebuild_opener()
+                    time.sleep(0.4 * (attempt + 1))
+                    current = url
+                    send_data = data
+                    send_method = method
+                    send_post = is_post
+                    continue
+                if not fatal:
+                    raise TimeoutError(str(getattr(exc, "reason", exc))) from exc
+                if is_post and not handshake_ok:
+                    die(
+                        "提交请求超时。代码可能已经交上去了，请先查，不要连点:\n"
+                        "  ./submit status"
+                    )
+                if is_post:
+                    die(
+                        "提交时 TLS 握手一直超时。代码多半没交上去，请再试一次；\n"
+                        "不确定的话先: ./submit status"
+                    )
+                die(f"网络错误: {getattr(exc, 'reason', exc)}")
+        if not fatal:
+            raise TimeoutError(str(last_err))
+        die(f"请求失败: {url} ({last_err})")
+        raise AssertionError
+
+    def get(self, url: str, timeout: int = 15, retries: int = 0, fatal: bool = True) -> Tuple[int, str, str]:
+        return self._request(url, timeout=timeout, retries=retries, fatal=fatal)
+
+    def post_form(self, url: str, fields: dict, timeout: int = 25, referer: Optional[str] = None) -> Tuple[int, str, str]:
+        data = urlencode(fields).encode("utf-8")
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Origin": self.site,
+        }
+        if referer:
+            headers["Referer"] = referer
+        return self._request(url, data=data, headers=headers, timeout=timeout, retries=2)
+
+    def post_multipart(
+        self,
+        url: str,
+        fields: Dict[str, str],
+        files: Optional[Dict[str, Tuple[str, bytes, str]]] = None,
+        timeout: int = 20,
+        referer: Optional[str] = None,
+        fatal: bool = True,
+    ) -> Tuple[int, str, str]:
+        boundary = "----XcpcQoj" + uuid.uuid4().hex
+        chunks: List[bytes] = []
+
+        def add_field(name: str, value: str) -> None:
+            chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+            chunks.append(
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8")
+            )
+            chunks.append(value.encode("utf-8"))
+            chunks.append(b"\r\n")
+
+        def add_file(name: str, filename: str, content: bytes, ctype: str) -> None:
+            chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+            chunks.append(
+                (
+                    f'Content-Disposition: form-data; name="{name}"; '
+                    f'filename="{filename}"\r\n'
+                    f"Content-Type: {ctype}\r\n\r\n"
+                ).encode("utf-8")
+            )
+            chunks.append(content)
+            chunks.append(b"\r\n")
+
+        for key, value in fields.items():
+            add_field(key, value)
+        for key, (filename, content, ctype) in (files or {}).items():
+            add_file(key, filename, content, ctype)
+        chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+        body = b"".join(chunks)
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Origin": self.site,
+        }
+        if referer:
+            headers["Referer"] = referer
+        return self._request(url, data=body, headers=headers, timeout=timeout, retries=1, fatal=fatal)
+
+
+def extract_token(page: str) -> str:
+    patterns = [
+        r'name=["\']_token["\'][^>]*value=["\']([^"\']+)["\']',
+        r'value=["\']([^"\']+)["\'][^>]*name=["\']_token["\']',
+        r'_token\s*:\s*["\']([^"\']+)["\']',
+        r'name="_token"\s+value="([^"]+)"',
+    ]
+    for pat in patterns:
+        m = re.search(pat, page, re.I)
+        if m and m.group(1).strip():
+            return htmlmod.unescape(m.group(1).strip())
+    return ""
+
+
+def extract_alerts(page: str) -> str:
+    parts: List[str] = []
+    for pat in (
+        r'class=["\'][^"\']*alert-danger[^"\']*["\'][^>]*>(.*?)</div>',
+        r'class=["\'][^"\']*alert-warning[^"\']*["\'][^>]*>(.*?)</div>',
+        r'class=["\'][^"\']*alert[^"\']*["\'][^>]*>(.*?)</div>',
+    ):
+        for m in re.finditer(pat, page or "", re.I | re.S):
+            text = strip_html(m.group(1)).strip()
+            if text and text not in parts and len(text) < 300:
+                parts.append(text)
+    return " / ".join(parts[:3])
+
+
+def extract_submit_button(page: str) -> Tuple[str, str]:
+    m = re.search(
+        r"<(?:button|input)\b([^>]*name=[\"']submit-answer[\"'][^>]*)>",
+        page or "",
+        re.I,
+    )
+    if m:
+        return "submit-answer", _html_attr(m.group(1), "value") or "answer"
+    return "submit-answer", "answer"
+
+
+def extract_username(page: str) -> str:
+    """Read the logged-in handle from the navbar, not footer/announcement links.
+
+    QOJ pages always contain /user/profile/Qingyu (site owner). The real account
+    sits next to Logout / 登出 in the navigation bar.
+    """
+    logout_at = [m.start() for m in re.finditer(r'href=["\'][^"\']*/logout["\']', page, re.I)]
+    if not logout_at:
+        logout_at = [m.start() for m in re.finditer(r">\s*(Logout|登出)\s*<", page, re.I)]
+    best = ""
+    best_dist = 10**9
+    for pm in re.finditer(r"/user/profile/([^\"'/?#<\s]+)", page):
+        for pos in logout_at:
+            dist = abs(pm.start() - pos)
+            if dist < best_dist:
+                best_dist = dist
+                best = pm.group(1)
+    if best and best_dist < 2500:
+        return htmlmod.unescape(best)
+
+    nav = re.search(r"<nav\b[^>]*>(.*?)</nav>", page, re.I | re.S)
+    if nav:
+        names = re.findall(r"/user/profile/([^\"'/?#<\s]+)", nav.group(1))
+        if names:
+            return htmlmod.unescape(names[0])
+
+    m = re.search(r'data-username=["\']([^"\']+)["\']', page, re.I)
+    if m:
+        return htmlmod.unescape(m.group(1))
+    return ""
+
+
+def looks_logged_in(page: str, url: str = "", expect: str = "") -> bool:
+    if re.search(r'id=["\']form-login["\']', page, re.I) or re.search(
+        r'id=["\']input-username["\']', page, re.I
+    ):
+        return False
+    if "/login" in (url or "") and re.search(r"<title>[^<]*(Login|登录)", page, re.I):
+        return False
+    if re.search(r'href=["\'][^"\']*/logout["\']', page, re.I):
+        return True
+    if re.search(r">\s*(Logout|登出)\s*<", page, re.I):
+        return True
+    if expect and re.search(
+        rf"/user/profile/{re.escape(expect)}(?:['\"/?#<\s]|$)", page
+    ):
+        return True
+    return False
+
+
+def _html_attr(attrs: str, name: str) -> str:
+    m = re.search(
+        rf'''(?:^|\s){re.escape(name)}\s*=\s*(?:["']([^"']*)["']|([^\s>]+))''',
+        attrs or "",
+        re.I,
+    )
+    if not m:
+        return ""
+    return htmlmod.unescape((m.group(1) or m.group(2) or "").strip())
+
+
+def _parse_option_tags(inner: str) -> List[Tuple[str, str]]:
+    options: List[Tuple[str, str]] = []
+    for om in re.finditer(r"<option\b([^>]*)>(.*?)</option>", inner or "", re.I | re.S):
+        attrs, label = om.group(1), strip_html(om.group(2))
+        value = _html_attr(attrs, "value")
+        if not value:
+            value = label
+        if "disabled" in attrs.lower() and not value:
+            continue
+        if value or label:
+            options.append((value, label or value))
+    return options
+
+
+def _is_prog_lang_options(options: List[Tuple[str, str]]) -> bool:
+    blob = " ".join(f"{v} {l}" for v, l in options).lower()
+    return any(
+        k in blob
+        for k in ("c++", "python", "pypy", "java", "rust", "kotlin", "pascal", "haskell")
+    )
+
+
+def parse_select_options(page: str, name: str) -> List[Tuple[str, str]]:
+    want = (name or "").lower()
+    want_id = f"input-{want}"
+    for sm in re.finditer(r"<select\b([^>]*)>(.*?)</select>", page, re.I | re.S):
+        attrs, inner = sm.group(1), sm.group(2)
+        nm = _html_attr(attrs, "name").lower()
+        sid = _html_attr(attrs, "id").lower()
+        if nm == want or sid in (want, want_id):
+            return _parse_option_tags(inner)
+    return []
+
+
+def collect_language_options(page: str) -> Tuple[str, List[Tuple[str, str]]]:
+    """Find the programming-language <select>, not the statement Languages dropdown."""
+    preferred: List[Tuple[str, List[Tuple[str, str]]]] = []
+    others: List[Tuple[str, List[Tuple[str, str]]]] = []
+    for sm in re.finditer(r"<select\b([^>]*)>(.*?)</select>", page, re.I | re.S):
+        attrs, inner = sm.group(1), sm.group(2)
+        name = _html_attr(attrs, "name") or "answer_answer_language"
+        opts = _parse_option_tags(inner)
+        if not opts or not _is_prog_lang_options(opts):
+            continue
+        if "answer" in name.lower() or "language" in name.lower():
+            preferred.append((name, opts))
+        else:
+            others.append((name, opts))
+    if preferred:
+        preferred.sort(key=lambda x: (0 if "answer" in x[0].lower() else 1, x[0]))
+        return preferred[0]
+    if others:
+        return others[0]
+    radios: List[Tuple[str, str]] = []
+    radio_name = "answer_answer_language"
+    for im in re.finditer(r"<input\b([^>]*)>", page, re.I):
+        attrs = im.group(1)
+        if _html_attr(attrs, "type").lower() != "radio":
+            continue
+        name = _html_attr(attrs, "name")
+        value = _html_attr(attrs, "value")
+        if "language" in name.lower() and value:
+            radio_name = name
+            radios.append((value, value))
+    if radios and _is_prog_lang_options(radios):
+        return radio_name, radios
+    return "answer_answer_language", []
+
+
+def pick_language(options: List[Tuple[str, str]], suffix: str, explicit: Optional[str] = None) -> str:
+    if not options:
+        die("题目页没有语言选项，可能未登录或还没开始 VP")
+    if explicit:
+        want = norm_lang(explicit)
+        for value, label in options:
+            if want in (norm_lang(value), norm_lang(label)) or want == norm_lang(value):
+                return value
+            if want in norm_lang(label) or want in norm_lang(value):
+                return value
+        names = ", ".join(f"{v} ({l})" if l != v else v for v, l in options)
+        die(f"找不到语言 {explicit!r}。可选: {names}")
+    prefer = EXT_LANG_PREFER.get(suffix.lower(), [])
+    ranked: List[Tuple[int, str]] = []
+    for value, label in options:
+        token = norm_lang(value) or norm_lang(label)
+        score = 10_000
+        for i, pref in enumerate(prefer):
+            if pref == token or token.startswith(pref) or pref in token:
+                score = i
+                break
+        ranked.append((score, value))
+    ranked.sort(key=lambda x: x[0])
+    return ranked[0][1]
+
+
+def canonical_problem_url(url: str) -> str:
+    parsed = urlparse(url)
+    path = re.sub(r"/statement/[^/]+/?$", "", parsed.path or "")
+    path = re.sub(r"/(?:statistics|hack)/?$", "", path)
+    path = path.rstrip("/") or "/"
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", "", ""))
+
+
+def problem_page_candidates(url: str, site: str, contest_id: str, problem_id: str) -> List[str]:
+    base = canonical_problem_url(url)
+    if not re.search(r"/problem/\d+$", base):
+        if contest_id:
+            base = f"{site.rstrip('/')}/contest/{contest_id}/problem/{problem_id}"
+        else:
+            base = f"{site.rstrip('/')}/problem/{problem_id}"
+    out: List[str] = []
+    for item in (
+        f"{base}/statement/zh_cn",
+        f"{base}/statement/default",
+        f"{base}/statement/en",
+        base + "?tab=submit-answer",
+        f"{base}/submit",
+        base + "?tab=submit",
+        base,
+        base + "?locale=en",
+        f"{site.rstrip('/')}/problem/{problem_id}?tab=submit-answer",
+        f"{site.rstrip('/')}/problem/{problem_id}/submit",
+        f"{site.rstrip('/')}/problem/{problem_id}",
+    ):
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def iter_submit_hrefs(page: str, current_url: str) -> List[str]:
+    found: List[str] = []
+
+    def add(href: str) -> None:
+        href = htmlmod.unescape(href or "").strip()
+        if not href or href.startswith("javascript:"):
+            return
+        if href.startswith("#"):
+            href = current_url.split("#")[0]
+        else:
+            href = urljoin(current_url, href).split("#")[0]
+        if href not in found:
+            found.append(href)
+
+    for href in re.findall(r'href=["\']([^"\']*tab-submit-answer[^"\']*)["\']', page or "", re.I):
+        add(href)
+    for href in re.findall(r'href=["\']([^"\']+/submit(?:\?[^"\']*)?)["\']', page or "", re.I):
+        add(href)
+    for href, inner in re.findall(
+        r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        page or "",
+        re.I | re.S,
+    ):
+        text = strip_html(inner).strip().lower()
+        if text in ("submit", "提交", "submit!"):
+            add(href)
+    return found
+
+
+def extract_form_action(page: str, current_url: str) -> str:
+    for m in re.finditer(r"<form\b([^>]*)>(.*?)</form>", page or "", re.I | re.S):
+        attrs, body = m.group(1), m.group(2)
+        if "submit-answer" not in body and "answer_answer" not in body:
+            continue
+        action = _html_attr(attrs, "action")
+        if not action:
+            return current_url.split("#")[0]
+        return urljoin(current_url, action).split("#")[0]
+    return ""
+
+
+def parse_contest_problems(page: str, site: str, contest_id: str) -> Dict[str, dict]:
+    problems: Dict[str, dict] = {}
+    row_re = re.compile(
+        r"<tr\b[^>]*>\s*"
+        r"<td\b[^>]*>\s*([A-Za-z]{1,2})\s*</td>\s*"
+        r"<td\b[^>]*>\s*<a\b[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+        re.I | re.S,
+    )
+    for letter, href, title_html in row_re.findall(page):
+        href = htmlmod.unescape(href)
+        m = re.search(rf"/contest/{contest_id}/problem/(\d+)", href)
+        if not m:
+            continue
+        pid = m.group(1)
+        url = canonical_problem_url(urljoin(site + "/", href))
+        problems[letter.upper()] = {
+            "id": pid,
+            "title": strip_html(title_html) or pid,
+            "url": url,
+        }
+
+    if problems:
+        return problems
+
+    link_re = re.compile(
+        rf'href=["\']([^"\']*/contest/{contest_id}/problem/(\d+)[^"\']*)["\'][^>]*>(.*?)</a>',
+        re.I | re.S,
+    )
+    seen = set()
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    idx = 0
+    for href, pid, title_html in link_re.findall(page):
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if idx >= len(letters):
+            letter = f"P{idx + 1}"
+        else:
+            letter = letters[idx]
+        idx += 1
+        problems[letter] = {
+            "id": pid,
+            "title": strip_html(title_html) or pid,
+            "url": canonical_problem_url(urljoin(site + "/", htmlmod.unescape(href))),
+        }
+    return problems
+
+
+def parse_contest_name(page: str) -> str:
+    m = re.search(r"<title>(.*?)</title>", page, re.I | re.S)
+    if m:
+        title = strip_html(m.group(1))
+        title = re.sub(r"\s*[-|].*$", "", title).strip()
+        if title:
+            return title
+    m = re.search(r"<h1\b[^>]*>(.*?)</h1>", page, re.I | re.S)
+    if m:
+        return strip_html(m.group(1))
+    return ""
+
+
+def _uoj_status_text(html: str) -> str:
+    m = re.search(
+        r'class=["\'][^"\']*uoj-status[^"\']*["\'][^>]*>(.*?)</(?:a|span|div|td|b)',
+        html or "",
+        re.I | re.S,
+    )
+    if m:
+        return strip_html(m.group(1))
+    return ""
+
+
+def parse_submission_rows(page: str) -> List[dict]:
+    rows = []
+    seen = set()
+    for tr in re.findall(r"<tr\b[^>]*>(.*?)</tr>", page, re.I | re.S):
+        sid_m = re.search(r"/submission/(\d+)", tr)
+        if not sid_m:
+            continue
+        sid = sid_m.group(1)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        links = [(htmlmod.unescape(h), strip_html(t)) for h, t in re.findall(
+            r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', tr, re.I | re.S
+        )]
+        problem = ""
+        for href, text in links:
+            if "/problem/" in href:
+                problem = text
+                break
+        cells = [strip_html(td) for td in re.findall(r"<td\b[^>]*>(.*?)</td>", tr, re.I | re.S)]
+        status = _uoj_status_text(tr)
+        if not status:
+            for cell in cells:
+                low = cell.lower()
+                if any(k in low for k in (
+                    "accept", "wrong", "error", "limit", "judg", "wait", "compil",
+                    "runtime", "point", "score", "正确", "错误", "超限", "评测", "等待",
+                )):
+                    status = cell
+                    break
+        if not status and len(cells) >= 5:
+            status = cells[4] if len(cells) > 4 else cells[-1]
+        rows.append({
+            "id": sid,
+            "problem": problem,
+            "status": status or "?",
+            "cells": cells,
+            "submit_ts": _parse_submit_clock(cells),
+            "url_path": f"/submission/{sid}",
+        })
+    return rows
+
+
+def _parse_submit_clock(cells: List[str]) -> Optional[float]:
+    for cell in cells or []:
+        m = re.search(r"(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}(?::\d{2})?)", cell)
+        if not m:
+            continue
+        text = m.group(1)
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return time.mktime(time.strptime(text, fmt))
+            except ValueError:
+                continue
+    return None
+
+
+def parse_submission_status(page: str) -> dict:
+    text = strip_html(page)
+    status = _uoj_status_text(page)
+    scoped = re.search(
+        r'class=["\'][^"\']*(?:uoj-status|submission-status|verdict)[^"\']*["\'][^>]*>(.*?)</',
+        page,
+        re.I | re.S,
+    )
+    blob = strip_html(scoped.group(1)) if scoped else (status or page)
+    fail_re = (
+        r"(Wrong Answer|Time Limit Exceeded|Memory Limit Exceeded|Runtime Error|"
+        r"Compile Error|Compilation Error|Output Limit Exceeded|"
+        r"Dangerous Syscall|System Error|Partially Correct|"
+        r"答案错误|时间超限|内存超限|运行错误|编译错误|输出超限)"
+    )
+    fail = re.search(fail_re, blob, re.I)
+    if not fail:
+        for sm in re.finditer(
+            r'class=["\'][^"\']*uoj-status[^"\']*["\'][^>]*>(.*?)</',
+            page or "",
+            re.I | re.S,
+        ):
+            fail = re.search(fail_re, strip_html(sm.group(1)), re.I)
+            if fail:
+                break
+    if fail:
+        status = strip_html(fail.group(1))
+    elif not status or _test_pending(status):
+        ac = None
+        for sm in re.finditer(
+            r'class=["\'][^"\']*uoj-status[^"\']*["\'][^>]*>(.*?)</',
+            page or "",
+            re.I | re.S,
+        ):
+            piece = strip_html(sm.group(1))
+            if re.search(r"(Accepted|正确)", piece, re.I) and not _test_pending(piece):
+                ac = piece
+                break
+        if ac:
+            status = ac
+        elif not status:
+            pend = re.search(
+                r"(Judging|Waiting|Compiling|Pending|评测中|等待评测|编译中)",
+                blob,
+                re.I,
+            )
+            if pend:
+                status = strip_html(pend.group(1))
+    score_m = re.search(r"\b(\d{1,3})\s*(?:/|&nbsp;/&nbsp;|/)\s*100\b", text)
+    if not score_m:
+        score_m = re.search(r"(?:score|分数|得分)\s*[:：]?\s*(\d{1,3})\b", text, re.I)
+    time_m = re.search(r"(\d+(?:\.\d+)?)\s*ms", text, re.I)
+    mem_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:KB|KiB|MB|MiB)", text, re.I)
+    score = score_m.group(1) if score_m else ""
+    low = (status or "").lower()
+    failed = bool(fail)
+    pending = (not status) or any(h in low for h in PENDING_HINTS)
+    if failed or any(
+        v in low for v in ("accepted", "正确", "wrong", "error", "exceeded", "编译错误", "答案")
+    ):
+        pending = False
+    if "compile error" in low or "compilation error" in low:
+        pending = False
+    if (
+        not failed
+        and pending
+        and score == "100"
+        and re.search(r"\b100\s*/\s*100\b", text)
+    ):
+        pending = False
+        status = "Accepted"
+    return {
+        "status": status or "Judging",
+        "score": score,
+        "time": time_m.group(0) if time_m else "",
+        "memory": mem_m.group(0) if mem_m else "",
+        "pending": pending,
+    }
+
+
+TEST_VERDICT_RE = (
+    r"(Compile Error|Compilation Error|Accepted|Wrong Answer|"
+    r"Time Limit Exceeded|Memory Limit Exceeded|Runtime Error|"
+    r"Output Limit Exceeded|Dangerous Syscall|System Error|"
+    r"Partially Correct|Skipped|Judging|Waiting|Compiling|Pending|"
+    r"编译错误|答案错误|时间超限|内存超限|运行错误|输出超限|正确|评测中|等待评测|编译中)"
+)
+
+
+def _cell_time(text: str) -> str:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*ms", text or "", re.I)
+    return m.group(0) if m else ""
+
+
+def _cell_memory(text: str) -> str:
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:KB|KiB|MB|MiB)", text or "", re.I)
+    return m.group(0) if m else ""
+
+
+def _test_pending(status: str) -> bool:
+    low = (status or "").lower()
+    if not status:
+        return True
+    return any(
+        h in low
+        for h in ("waiting", "judging", "pending", "compiling", "评测中", "等待评测", "编译中")
+    )
+
+
+def _split_submission_html(page: str) -> Tuple[str, str]:
+    m = re.search(
+        r'(id=["\'](?:details|status-details|testdata)["\']|>\s*Testdata\s*<|测试点详情)',
+        page or "",
+        re.I,
+    )
+    if m:
+        return page[: m.start()], page[m.start() :]
+    m = re.search(r"<tr\b[^>]*>[\s\S]{0,80}#\s*1\b", page or "", re.I)
+    if m:
+        return page[: m.start()], page[m.start() :]
+    return page or "", page or ""
+
+
+def parse_submission_tests(page: str, sid: str = "") -> List[dict]:
+    tests: List[dict] = []
+    seen = set()
+    sid = str(sid or "").lstrip("#")
+
+    def valid_idx(idx: str) -> bool:
+        if not str(idx).isdigit():
+            return False
+        n = int(idx)
+        if n < 1 or n > 999:
+            return False
+        if sid and str(n) == sid:
+            return False
+        return True
+
+    def add(idx: str, status: str, time_s: str, mem_s: str) -> None:
+        if not valid_idx(idx):
+            return
+        idx = str(int(idx))
+        status = (status or "").strip()
+        item = {
+            "id": idx,
+            "status": status or "Judging",
+            "time": time_s or "",
+            "memory": mem_s or "",
+            "pending": _test_pending(status),
+        }
+        if idx in seen:
+            for old in tests:
+                if old["id"] == idx:
+                    if status and not _test_pending(status):
+                        old.update(item)
+                    elif not old.get("time") and time_s:
+                        old.update(item)
+                    break
+            return
+        seen.add(idx)
+        tests.append(item)
+
+    for tr in re.findall(r"<tr\b[^>]*>(.*?)</tr>", page or "", re.I | re.S):
+        if re.search(r"/submission/\d+", tr):
+            continue
+        raw_cells = re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", tr, re.I | re.S)
+        cells = [strip_html(td) for td in raw_cells]
+        joined = " ".join(cells)
+        if re.search(r"subtask", joined, re.I) and not re.search(r"#\s*\d{1,3}\b", joined):
+            continue
+        idx = ""
+        for cell in cells[:3]:
+            if re.search(r"subtask", cell, re.I):
+                continue
+            m = re.search(
+                r"^(?:#|test(?:\s*case)?|测试点?)?\s*(\d{1,3})$",
+                cell,
+                re.I,
+            )
+            if m and valid_idx(m.group(1)):
+                idx = m.group(1)
+                break
+        if not idx:
+            continue
+        status = _uoj_status_text(tr)
+        if not status:
+            m = re.search(TEST_VERDICT_RE, joined, re.I)
+            if m:
+                status = m.group(1)
+        if not status and not _cell_time(joined):
+            continue
+        add(idx, status, _cell_time(joined), _cell_memory(joined))
+
+    if not tests:
+        text = strip_html(page or "")
+        for m in re.finditer(
+            rf"(?:#|测试点)\s*(\d{{1,3}})\b\s*[:.\s]+{TEST_VERDICT_RE}"
+            r"(?:\s+(\d+(?:\.\d+)?\s*ms))?"
+            r"(?:\s+(\d+(?:\.\d+)?\s*(?:KB|KiB|MB|MiB)))?",
+            text,
+            re.I,
+        ):
+            add(m.group(1), m.group(2), m.group(3) or "", m.group(4) or "")
+        prog = re.search(
+            r"(?:Judging(?:\s+on)?\s+test|评测(?:中)?(?:到)?(?:第)?(?:测试点)?)\s*#?\s*(\d{1,3})\b",
+            text,
+            re.I,
+        )
+        if prog and valid_idx(prog.group(1)) and prog.group(1) not in seen:
+            add(prog.group(1), "Judging", "", "")
+    tests.sort(key=lambda t: int(t["id"]) if str(t["id"]).isdigit() else 10**9)
+    return tests
+
+
+def _is_ac_status(status: str) -> bool:
+    low = (status or "").lower()
+    return ("accepted" in low or "正确" in low) and "wrong" not in low
+
+
+def parse_submission_detail(page: str, sid: str = "") -> dict:
+    head, details = _split_submission_html(page)
+    overall = parse_submission_status(head)
+    tests = parse_submission_tests(details, sid=sid)
+    if not tests:
+        tests = parse_submission_tests(page, sid=sid)
+    current = tests[-1] if tests else None
+    tests_pending = bool(tests) and any(t.get("pending") for t in tests)
+    tests_done = bool(tests) and not tests_pending
+    pending = bool(overall.get("pending"))
+    if tests_pending:
+        pending = True
+    if tests_done:
+        pending = False
+        if overall.get("pending") or _test_pending(overall.get("status") or ""):
+            fails = [t for t in tests if not _is_ac_status(t.get("status") or "")]
+            if fails:
+                overall = dict(overall)
+                overall["status"] = fails[0]["status"]
+                overall["pending"] = False
+                if fails[0].get("time"):
+                    overall["time"] = fails[0]["time"]
+                if fails[0].get("memory"):
+                    overall["memory"] = fails[0]["memory"]
+            else:
+                overall = dict(overall)
+                overall["status"] = "Accepted"
+                overall["pending"] = False
+    return {
+        "overall": overall,
+        "tests": tests,
+        "current": current,
+        "pending": pending,
+        "judged": len([t for t in tests if not t.get("pending")]),
+    }
+
+
+def md5_hex(s: str) -> str:
+    return hashlib.md5(s.encode("utf-8")).hexdigest()
+
+
+def hmac_md5_hex(key: str, data: str) -> str:
+    return hmac.new(key.encode("utf-8"), data.encode("utf-8"), hashlib.md5).hexdigest()
+
+
+def make_client(cfg: dict, contest: Optional[dict] = None, debug: bool = False) -> Client:
+    site = (contest or {}).get("site") or cfg.get("site") or DEFAULT_SITE
+    cookie = cfg.get("cookie") or ""
+    ua = cfg.get("user_agent") or DEFAULT_UA
+    if not cookie:
+        die(
+            f"尚未登录。先运行: {Path(sys.argv[0]).name} login\n"
+            f"配置文件: {global_config_path()}"
+        )
+    return Client(site, cookie=cookie, user_agent=ua, debug=debug)
+
+
+def require_contest() -> Tuple[Path, dict]:
+    path = find_contest_file()
+    if path:
+        return path, load_json(path)
+    cfg = load_global()
+    cached = cfg.get("contest")
+    if isinstance(cached, dict) and cached.get("problems"):
+        return global_config_path(), cached
+    try:
+        uid = input("比赛 UID: ").strip()
+    except EOFError:
+        uid = ""
+    if not uid:
+        die("需要比赛 UID。先执行: python3 submit 1234")
+    data = bind_contest(uid, start=True)
+    return Path.cwd() / CONTEST_FILE, data
+
+
+def copy_self_to(dest_dir: Path) -> Optional[Path]:
+    src = Path(__file__).resolve()
+    dest = dest_dir / "submit"
+    if dest.resolve() == src:
+        return dest
+    data = src.read_bytes()
+    dest.write_bytes(data)
+    try:
+        dest.chmod(dest.stat().st_mode | 0o111)
+    except OSError:
+        pass
+    return dest
+
+
+def _cookies_to_header(cookies) -> str:
+    pairs = []
+    for item in cookies or []:
+        name = value = None
+        if isinstance(item, dict):
+            name, value = item.get("name"), item.get("value")
+        else:
+            name = getattr(item, "name", None)
+            value = getattr(item, "value", None)
+        if name and value is not None:
+            pairs.append(f"{name}={value}")
+    return "; ".join(pairs)
+
+
+def _wait_html_logged_in(get_html_url, timeout: int = 900) -> Tuple[str, str]:
+    deadline = time.time() + timeout
+    last_html, last_url = "", ""
+    while time.time() < deadline:
+        try:
+            last_html, last_url = get_html_url()
+        except Exception as exc:
+            die(f"登录窗口已关闭或浏览器退出 ({exc})")
+        if looks_logged_in(last_html, last_url):
+            return last_html, last_url
+        time.sleep(0.7)
+    die("等待登录超时（15 分钟）。请重新执行 ./submit login")
+    raise AssertionError
+
+
+def _which(cmd: str) -> Optional[str]:
+    from shutil import which
+    return which(cmd)
+
+
+def _linux_display_ok() -> bool:
+    if os.name == "nt":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _chrome_like_options(binary: Optional[str] = None, profile: Optional[Path] = None):
+    from selenium.webdriver.chrome.options import Options
+    opts = Options()
+    for arg in (
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-extensions",
+        "--window-size=1100,820",
+        "--disable-blink-features=AutomationControlled",
+        "--remote-allow-origins=*",
+    ):
+        opts.add_argument(arg)
+    if profile:
+        opts.add_argument(f"--user-data-dir={str(profile)}")
+    if binary:
+        opts.binary_location = binary
+    try:
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    except Exception:
+        pass
+    return opts
+
+
+def _selenium_try_chrome(binary: Optional[str] = None) -> object:
+    from selenium import webdriver
+    profile = xdg_config_dir() / "browser-profile-chrome"
+    profile.mkdir(parents=True, exist_ok=True)
+    opts = _chrome_like_options(binary=binary, profile=profile)
+    return webdriver.Chrome(options=opts)
+
+
+def _selenium_try_firefox(binary: Optional[str] = None) -> object:
+    from selenium import webdriver
+    from selenium.webdriver.firefox.options import Options as FirefoxOptions
+    opts = FirefoxOptions()
+    if binary:
+        opts.binary_location = binary
+    return webdriver.Firefox(options=opts)
+
+
+def _login_selenium(site: str) -> Optional[Tuple[str, str, str]]:
+    try:
+        from selenium import webdriver
+    except ImportError:
+        return None
+
+    if not _linux_display_ok():
+        warn("当前没有图形界面（DISPLAY 为空）。请在虚拟机桌面终端运行，不要用纯 SSH。")
+        return None
+
+    attempts = []
+    chrome_bin = (
+        _which("google-chrome-stable")
+        or _which("google-chrome")
+        or _which("chromium")
+        or _which("chromium-browser")
+    )
+    firefox_bin = _which("firefox") or _which("firefox-esr")
+    if chrome_bin:
+        attempts.append(("Chrome/Chromium", lambda b=chrome_bin: _selenium_try_chrome(b)))
+    attempts.append(("Chrome for Testing", lambda: _selenium_try_chrome(None)))
+    if firefox_bin:
+        attempts.append(("Firefox", lambda b=firefox_bin: _selenium_try_firefox(b)))
+    else:
+        attempts.append(("Firefox", lambda: _selenium_try_firefox(None)))
+
+    last_err = None
+    driver = None
+    used = ""
+    for name, factory in attempts:
+        try:
+            info(f"正在启动 {name} ...")
+            driver = factory()
+            used = name
+            break
+        except Exception as exc:
+            last_err = exc
+            warn(f"{name} 启动失败: {exc}")
+            driver = None
+
+    if driver is None:
+        warn(f"未能启动浏览器: {last_err}")
+        warn("Linux 虚拟机请安装 Firefox 后再试:")
+        warn("  sudo apt install firefox")
+        return None
+
+    info(f"已弹出 {used} 窗口，请在窗口里登录 QOJ（Cloudflare 也在窗口里完成）")
+    info("登录成功后窗口会自动关闭")
+    try:
+        try:
+            driver.set_window_size(1100, 820)
+        except Exception:
+            pass
+        driver.get(site.rstrip("/") + "/login")
+        html, url = _wait_html_logged_in(
+            lambda: (driver.page_source, driver.current_url)
+        )
+        ua = driver.execute_script("return navigator.userAgent") or DEFAULT_UA
+        cookie = _cookies_to_header(driver.get_cookies())
+        return cookie, ua, html
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+
+def _login_playwright(site: str) -> Optional[Tuple[str, str, str]]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+
+    profile = str(xdg_config_dir() / "playwright-profile")
+    Path(profile).mkdir(parents=True, exist_ok=True)
+    info("已弹出浏览器窗口，请在窗口里登录 QOJ（Cloudflare 验证也在窗口里完成）")
+    info("登录成功后窗口会自动关闭")
+    try:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                profile,
+                headless=False,
+                viewport={"width": 1100, "height": 800},
+            )
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto(site.rstrip("/") + "/login", wait_until="domcontentloaded")
+            html, url = _wait_html_logged_in(
+                lambda: (page.content(), page.url)
+            )
+            ua = page.evaluate("navigator.userAgent") or DEFAULT_UA
+            cookie = _cookies_to_header(context.cookies())
+            context.close()
+            return cookie, ua, html
+    except Exception as exc:
+        warn(f"Playwright 登录失败: {exc}")
+        return None
+
+
+def _login_webview(site: str) -> Optional[Tuple[str, str, str]]:
+    try:
+        import webview
+    except ImportError:
+        return None
+
+    result: dict = {}
+    storage = xdg_config_dir() / "webview"
+    storage.mkdir(parents=True, exist_ok=True)
+
+    def on_ready():
+        window = webview.windows[0]
+
+        def watcher():
+            try:
+                html, url = _wait_html_logged_in(
+                    lambda: (
+                        window.evaluate_js(
+                            "document.documentElement ? document.documentElement.outerHTML : ''"
+                        )
+                        or "",
+                        window.get_current_url() or "",
+                    )
+                )
+                ua = window.evaluate_js("navigator.userAgent") or DEFAULT_UA
+                cookies = []
+                try:
+                    cookies = window.get_cookies() or []
+                except Exception:
+                    pass
+                result["html"] = html
+                result["url"] = url
+                result["ua"] = ua
+                result["cookie"] = _cookies_to_header(cookies)
+            except SystemExit as exc:
+                result["error"] = str(exc)
+            except Exception as exc:
+                result["error"] = str(exc)
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+        threading.Thread(target=watcher, daemon=True).start()
+
+    info("已弹出登录窗口，请在窗口里登录 QOJ")
+    info("登录成功后窗口会自动关闭")
+    webview.create_window(
+        "QOJ 登录",
+        site.rstrip("/") + "/login",
+        width=1100,
+        height=820,
+    )
+    try:
+        webview.start(
+            on_ready,
+            private_mode=False,
+            storage_path=str(storage),
+        )
+    except TypeError:
+        webview.start(on_ready)
+    if result.get("error") and not result.get("cookie"):
+        warn(result["error"])
+        return None
+    if not result.get("cookie"):
+        return None
+    return result["cookie"], result.get("ua") or DEFAULT_UA, result.get("html") or ""
+
+
+def _free_port() -> int:
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+def _recvn(sock: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("CDP 连接已断开")
+        buf += chunk
+    return buf
+
+
+def _ws_connect(ws_url: str, timeout: int = 8) -> socket.socket:
+    parsed = urlparse(ws_url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    sock = socket.create_connection((host, port), timeout=timeout)
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    req = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n"
+    )
+    sock.sendall(req.encode("ascii"))
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    if b"101" not in data.split(b"\r\n", 1)[0]:
+        sock.close()
+        raise ConnectionError("WebSocket 握手失败")
+    return sock
+
+
+def _ws_send(sock: socket.socket, text: str) -> None:
+    payload = text.encode("utf-8")
+    header = bytearray([0x81])
+    n = len(payload)
+    mask_bit = 0x80
+    if n < 126:
+        header.append(mask_bit | n)
+    elif n < 65536:
+        header.append(mask_bit | 126)
+        header += struct.pack("!H", n)
+    else:
+        header.append(mask_bit | 127)
+        header += struct.pack("!Q", n)
+    mask = os.urandom(4)
+    header += mask
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    sock.sendall(header + masked)
+
+
+def _ws_recv(sock: socket.socket) -> str:
+    hdr = _recvn(sock, 2)
+    opcode = hdr[0] & 0x0F
+    n = hdr[1] & 0x7F
+    masked = bool(hdr[1] & 0x80)
+    if n == 126:
+        n = struct.unpack("!H", _recvn(sock, 2))[0]
+    elif n == 127:
+        n = struct.unpack("!Q", _recvn(sock, 8))[0]
+    mask = _recvn(sock, 4) if masked else b""
+    payload = _recvn(sock, n)
+    if masked:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    if opcode == 0x8:
+        raise ConnectionError("CDP WebSocket 已关闭")
+    if opcode == 0x9:
+        return _ws_recv(sock)
+    return payload.decode("utf-8", errors="replace")
+
+
+def _cdp_rpc(sock: socket.socket, msg_id: int, method: str, params: Optional[dict] = None) -> dict:
+    body: dict = {"id": msg_id, "method": method}
+    if params:
+        body["params"] = params
+    _ws_send(sock, json.dumps(body))
+    while True:
+        raw = _ws_recv(sock)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if data.get("id") == msg_id:
+            return data
+
+
+def _cdp_http_json(port: int, path: str):
+    with urlopen(f"http://127.0.0.1:{port}{path}", timeout=3) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _cdp_harvest(port: int) -> Tuple[str, str, str]:
+    targets = _cdp_http_json(port, "/json/list")
+    page = None
+    for item in targets:
+        if item.get("type") == "page" and "qoj" in (item.get("url") or "").lower():
+            page = item
+            break
+    if page is None:
+        for item in targets:
+            if item.get("type") == "page" and item.get("webSocketDebuggerUrl"):
+                page = item
+                break
+    if not page or not page.get("webSocketDebuggerUrl"):
+        raise RuntimeError("没有可用的页面调试端口")
+    sock = _ws_connect(page["webSocketDebuggerUrl"])
+    try:
+        cookies = []
+        for method, params in (
+            ("Network.getAllCookies", None),
+            ("Storage.getCookies", None),
+        ):
+            ret = _cdp_rpc(sock, 1, method, params)
+            result = ret.get("result") or {}
+            cookies = result.get("cookies") or []
+            if cookies:
+                break
+        ua_ret = _cdp_rpc(
+            sock,
+            2,
+            "Runtime.evaluate",
+            {"expression": "navigator.userAgent", "returnByValue": True},
+        )
+        ua = (
+            ((ua_ret.get("result") or {}).get("result") or {}).get("value")
+            or DEFAULT_UA
+        )
+        html_ret = _cdp_rpc(
+            sock,
+            3,
+            "Runtime.evaluate",
+            {
+                "expression": "document.documentElement ? document.documentElement.outerHTML : ''",
+                "returnByValue": True,
+            },
+        )
+        html = (
+            ((html_ret.get("result") or {}).get("result") or {}).get("value") or ""
+        )
+        return _cookies_to_header(cookies), str(ua), str(html)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def _firefox_sqlite_cookies(profile: Path) -> Dict[str, str]:
+    src = profile / "cookies.sqlite"
+    if not src.is_file():
+        return {}
+    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+    os.close(fd)
+    tmp_path = Path(tmp)
+    extras = []
+    try:
+        shutil.copy2(src, tmp_path)
+        for suffix in ("-wal", "-shm"):
+            side = Path(str(src) + suffix)
+            if side.is_file():
+                dest = Path(str(tmp_path) + suffix)
+                shutil.copy2(side, dest)
+                extras.append(dest)
+        con = sqlite3.connect(str(tmp_path))
+        try:
+            rows = con.execute("SELECT host, name, value FROM moz_cookies").fetchall()
+        finally:
+            con.close()
+        out: Dict[str, str] = {}
+        preferred: Dict[str, str] = {}
+        for host, name, value in rows:
+            if not name or value is None:
+                continue
+            host_s = str(host or "")
+            if "qoj.ac" not in host_s:
+                continue
+            host_key = host_s.lstrip(".")
+            if host_key == "qoj.ac":
+                preferred[str(name)] = str(value)
+            elif str(name) not in preferred:
+                out[str(name)] = str(value)
+        out.update(preferred)
+        return out
+    except Exception:
+        return {}
+    finally:
+        for path in [tmp_path, *extras]:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _firefox_user_agent(binary: str, profile: Path) -> str:
+    for name in ("user.js", "prefs.js"):
+        path = profile / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        m = re.search(r'user_pref\("general\.useragent\.override",\s*"([^"]+)"\)', text)
+        if m:
+            return m.group(1)
+    try:
+        out = subprocess.check_output(
+            [binary, "--version"],
+            timeout=5,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        m = re.search(r"Firefox\s+(\d+)", out, re.I)
+        if m:
+            ver = m.group(1)
+            return (
+                f"Mozilla/5.0 (X11; Linux x86_64; rv:{ver}.0) "
+                f"Gecko/20100101 Firefox/{ver}.0"
+            )
+    except Exception:
+        pass
+    return "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+
+def _session_ready(cookie_header: str, html: str = "") -> bool:
+    names = cookie_names(cookie_header)
+    if names.get("UOJSESSID") and (
+        names.get("uoj_username") or names.get("uoj_remember_token")
+    ):
+        return True
+    return bool(names.get("UOJSESSID") and looks_logged_in(html))
+
+
+QOJ_SESSION_COOKIE_NAMES = (
+    "UOJSESSID",
+    "uoj_username",
+    "uoj_remember_token",
+    "uoj_password",
+)
+
+
+def _clear_named_cookies_sqlite(db: Path, table: str, name_col: str, host_col: str) -> bool:
+    if not db.is_file():
+        return False
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=rw", uri=True, timeout=5)
+        try:
+            placeholders = ",".join("?" * len(QOJ_SESSION_COOKIE_NAMES))
+            con.execute(
+                f"DELETE FROM {table} WHERE {name_col} IN ({placeholders})",
+                QOJ_SESSION_COOKIE_NAMES,
+            )
+            con.execute(
+                f"DELETE FROM {table} WHERE {host_col} LIKE ? AND {name_col} LIKE 'uoj%'",
+                ("%qoj.ac%",),
+            )
+            con.execute(
+                f"DELETE FROM {table} WHERE {host_col} LIKE ? AND {name_col} = 'UOJSESSID'",
+                ("%qoj.ac%",),
+            )
+            con.commit()
+            try:
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+        finally:
+            con.close()
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def _clear_firefox_session_restore(profile: Path) -> None:
+    if not profile.is_dir():
+        return
+    for name in (
+        "sessionstore.jsonlz4",
+        "sessionstore.js",
+        "sessionCheckpoints.json",
+        "recovery.jsonlz4",
+        "recovery.baklz4",
+    ):
+        try:
+            (profile / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+    bak = profile / "sessionstore-backups"
+    if bak.is_dir():
+        for p in bak.iterdir():
+            try:
+                if p.is_file():
+                    p.unlink()
+            except OSError:
+                pass
+
+
+def _clear_qoj_session_cookies(profile: Path) -> None:
+    if not profile.is_dir():
+        return
+    _clear_named_cookies_sqlite(profile / "cookies.sqlite", "moz_cookies", "name", "host")
+    _clear_firefox_session_restore(profile)
+    for db in (
+        profile / "Cookies",
+        profile / "Default" / "Cookies",
+        profile / "Default" / "Network" / "Cookies",
+    ):
+        _clear_named_cookies_sqlite(db, "cookies", "name", "host_key")
+
+
+def _forget_saved_login(cfg: dict) -> str:
+    old = str(cfg.get("username") or "")
+    cfg["cookie"] = ""
+    cfg["username"] = ""
+    save_global(cfg)
+    _kill_stale_login_browsers()
+    _clear_qoj_session_cookies(_firefox_profile_dir())
+    _clear_qoj_session_cookies(Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile")
+    return old
+
+
+def _wait_debug_port(port: int, proc: subprocess.Popen, seconds: float = 20) -> bool:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return False
+        try:
+            _cdp_http_json(port, "/json/version")
+            return True
+        except Exception:
+            time.sleep(0.25)
+    return False
+
+
+def _browser_binaries() -> List[Tuple[str, str]]:
+    found: List[Tuple[str, str]] = []
+    seen = set()
+    firefox_paths = [
+        "/usr/lib/firefox-esr/firefox",
+        "/usr/lib/firefox/firefox",
+        "/usr/bin/firefox-esr",
+        "/usr/bin/firefox",
+        _which("firefox-esr"),
+        _which("firefox"),
+    ]
+    chrome_paths = [
+        _which("chromium"),
+        _which("chromium-browser"),
+        _which("google-chrome-stable"),
+        _which("google-chrome"),
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    ranked: List[Tuple[int, str, str]] = []
+    for path in firefox_paths:
+        if not path:
+            continue
+        p = str(Path(path))
+        if not Path(p).exists() or p in seen:
+            continue
+        seen.add(p)
+        snap = 1 if "snap" in str(Path(p).resolve()).lower() else 0
+        ranked.append((snap, "firefox", p))
+    ranked.sort()
+    for _, kind, p in ranked:
+        found.append((kind, p))
+    for path in chrome_paths:
+        if not path:
+            continue
+        p = str(Path(path))
+        if Path(p).exists() and p not in seen:
+            seen.add(p)
+            found.append(("chromium", p))
+    return found
+
+
+def _firefox_profile_dir() -> Path:
+    snap_common = Path.home() / "snap" / "firefox" / "common"
+    if snap_common.is_dir():
+        dest = snap_common / "qoj-submit-profile"
+    else:
+        dest = Path.home() / ".local" / "share" / "qoj-xcpc" / "firefox-profile"
+    dest.mkdir(parents=True, exist_ok=True)
+    return dest
+
+
+def _unlock_browser_profile(profile: Path) -> None:
+    if not profile.is_dir():
+        return
+    for name in (
+        "lock",
+        "parent.lock",
+        ".parentlock",
+        "SingletonLock",
+        "SingletonSocket",
+        "SingletonCookie",
+    ):
+        path = profile / name
+        try:
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _proc_cmdline(pid: int) -> str:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+
+
+def _proc_comm(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _is_self_login_process(pid: int, me: int, my_exe: str) -> bool:
+    if pid <= 1 or pid == me or pid == os.getppid():
+        return True
+    cmd = _proc_cmdline(pid)
+    if not cmd:
+        return False
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        exe = ""
+    blob = f"{exe} {cmd}".replace("\\", "/")
+    if my_exe:
+        try:
+            if exe and Path(exe).resolve() == Path(my_exe).resolve() and "submit" in cmd:
+                return True
+        except OSError:
+            pass
+    if "qoj-xcpc/venv" in blob and "submit" in cmd:
+        return True
+    return False
+
+
+def _is_stale_login_browser(pid: int) -> bool:
+    comm = _proc_comm(pid)
+    cmd = _proc_cmdline(pid)
+    blob = f"{comm} {cmd}"
+    if comm in ("geckodriver", "chromedriver") or "geckodriver" in cmd or "chromedriver" in cmd:
+        return True
+    if "qoj-submit-profile" in blob:
+        return True
+    if "qoj-xcpc/firefox-profile" in blob or "qoj-xcpc/chromium-profile" in blob:
+        return True
+    if "--marionette" in cmd:
+        return True
+    return False
+
+
+def _kill_stale_login_browsers() -> None:
+    if os.name == "nt" or not Path("/proc").is_dir():
+        return
+    warn("正在结束上次登录残留的 geckodriver / 独立配置 Firefox（不会关掉你日常用的 Firefox）")
+    me = os.getpid()
+    try:
+        my_exe = os.readlink(f"/proc/{me}/exe")
+    except OSError:
+        my_exe = sys.executable
+    targets: List[int] = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return
+    for name in names:
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if _is_self_login_process(pid, me, my_exe):
+            continue
+        if _is_stale_login_browser(pid):
+            targets.append(pid)
+    for pid in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    if targets:
+        time.sleep(0.8)
+        for pid in targets:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                continue
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(0.4)
+
+
+def _start_ua_sniffer() -> Tuple[object, dict]:
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    captured = {"ua": ""}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            captured["ua"] = self.headers.get("User-Agent") or captured["ua"]
+            body = (
+                "<html><body style='font-family:sans-serif;padding:2em'>"
+                "<p>已记录浏览器 User-Agent。请回到 <b>QOJ 登录</b> 标签页完成验证并登录。</p>"
+                "</body></html>"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return
+
+    httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, captured
+
+
+def _start_real_browser(
+    kind: str, binary: str, site: str, profile: Path, port: int, extra_url: str = ""
+) -> Tuple[subprocess.Popen, Path]:
+    profile.mkdir(parents=True, exist_ok=True)
+    _unlock_browser_profile(profile)
+    url = site.rstrip("/") + "/logout"
+    env = os.environ.copy()
+    log_path = profile / "launch.log"
+    if kind == "firefox":
+        env["MOZ_NO_REMOTE"] = "1"
+        env["MOZ_DISABLE_AUTO_SAFE_MODE"] = "1"
+        cmd = [binary, "-no-remote", "--profile", str(profile), url]
+    else:
+        cmd = [
+            binary,
+            f"--remote-debugging-port={port}",
+            "--remote-debugging-address=127.0.0.1",
+            f"--user-data-dir={profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+            "--new-window",
+            url,
+        ]
+    if extra_url:
+        cmd.append(extra_url)
+    logf = open(log_path, "wb")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=logf,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=env,
+    )
+    return proc, log_path
+
+
+def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
+    if not _linux_display_ok():
+        warn("当前没有图形界面。请在虚拟机桌面终端运行 python3 submit login")
+        return None
+    binaries = _browser_binaries()
+    if not binaries:
+        warn("没有找到 firefox / chromium / chrome，请先: sudo apt install firefox")
+        return None
+
+    info("正在关闭上次登录残留的 Firefox / geckodriver ...")
+    _kill_stale_login_browsers()
+    _clear_qoj_session_cookies(_firefox_profile_dir())
+    _clear_qoj_session_cookies(Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile")
+
+    httpd, captured = _start_ua_sniffer()
+    try:
+        for kind, binary in binaries:
+            port = _free_port()
+            if kind == "firefox":
+                profile = _firefox_profile_dir()
+            else:
+                profile = Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile"
+            sniff_url = f"http://127.0.0.1:{httpd.server_address[1]}/"
+            ff_ua = _firefox_user_agent(binary, profile) if kind == "firefox" else DEFAULT_UA
+            info(f"正在打开普通 {kind}")
+            info(f"  程序: {binary}")
+            info(f"  配置: {profile}")
+            info("会先退出窗口里的旧账号。请在登录页登录要换的账号（含 Cloudflare）")
+            try:
+                proc, log_path = _start_real_browser(
+                    kind, binary, site, profile, port, extra_url=sniff_url
+                )
+            except Exception as exc:
+                warn(f"启动 {binary} 失败: {exc}")
+                continue
+            try:
+                time.sleep(2.0)
+                if proc.poll() is not None:
+                    tail = ""
+                    try:
+                        tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                    except OSError:
+                        pass
+                    warn(f"{kind} 启动后立刻退出。日志:\n{tail or '(无)'}")
+                    continue
+                cdp_ok = False
+                if kind != "firefox":
+                    cdp_ok = _wait_debug_port(port, proc)
+                deadline = time.time() + 900
+                last_cookie, last_ua, last_html = "", captured.get("ua") or ff_ua, ""
+                seen_logged_out = False
+                names0 = _firefox_sqlite_cookies(profile) if kind == "firefox" else {}
+                if not names0.get("UOJSESSID") and not names0.get("uoj_username"):
+                    seen_logged_out = True
+                last_hint = 0.0
+                while time.time() < deadline:
+                    if proc.poll() is not None:
+                        tail = ""
+                        try:
+                            tail = log_path.read_text(encoding="utf-8", errors="replace")[-1500:]
+                        except OSError:
+                            pass
+                        warn(f"{kind} 窗口已关闭。{tail}")
+                        break
+                    cookie = ua = html = ""
+                    if cdp_ok:
+                        try:
+                            cookie, ua, html = _cdp_harvest(port)
+                        except Exception:
+                            cdp_ok = _wait_debug_port(port, proc, seconds=1)
+                    if not cookie and kind == "firefox":
+                        names = _firefox_sqlite_cookies(profile)
+                        cookie = "; ".join(f"{k}={v}" for k, v in names.items())
+                    ua = ua or captured.get("ua") or last_ua or ff_ua
+                    ready = bool(cookie) and _session_ready(cookie, html)
+                    if ready and seen_logged_out:
+                        last_cookie, last_ua, last_html = cookie, ua, html or last_html
+                        ok("已检测到新的 QOJ 登录")
+                        return cookie, ua, html
+                    if ready and not seen_logged_out:
+                        now = time.time()
+                        if now - last_hint > 8:
+                            info("窗口里还是旧账号。请点 Logout，再登录新账号")
+                            last_hint = now
+                    else:
+                        seen_logged_out = True
+                        if cookie:
+                            last_cookie, last_ua, last_html = cookie, ua, html or last_html
+                    time.sleep(1.2)
+                if seen_logged_out and _session_ready(last_cookie, last_html):
+                    return last_cookie, last_ua, last_html
+            finally:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+    finally:
+        try:
+            httpd.shutdown()
+        except Exception:
+            pass
+    return None
+
+
+def login_via_browser(site: str) -> Tuple[str, str, str]:
+    got = _login_real_browser(site)
+    if got:
+        cookie, ua, html = got
+        if cookie_names(cookie).get("UOJSESSID") or looks_logged_in(html):
+            info("已用普通浏览器完成登录")
+            return cookie, ua, html
+    die(
+        "未能用普通 Firefox 登录。请关掉弹出的 QOJ 窗口后重试:\n"
+        "  python3 submit login\n"
+        "不要用带“自动化控制”提示的窗口。"
+    )
+    raise AssertionError
+
+
+def _finalize_login(
+    cfg: dict,
+    site: str,
+    cookie: str,
+    ua: str,
+    debug: bool,
+    fallback_user: str = "",
+) -> None:
+    cookie = parse_cookie_input(cookie)
+    names = cookie_names(cookie)
+    client = Client(site, cookie=cookie, user_agent=ua, debug=debug)
+    expect = names.get("uoj_username") or fallback_user or ""
+    status, url, page = client.get("/")
+    if not looks_logged_in(page, url, expect=expect):
+        status, url, page = client.get("/login")
+        if not looks_logged_in(page, url, expect=expect):
+            die(
+                "浏览器里看起来已经登录，但命令行请求仍未带上会话。\n"
+                "请再试一次 ./submit login，或确认弹出的窗口里确实登录成功。"
+            )
+    username = extract_username(page) or expect or cfg.get("username") or ""
+    cfg.update({
+        "site": site,
+        "cookie": client.cookie_header() or cookie,
+        "user_agent": ua,
+        "username": username,
+    })
+    save_global(cfg)
+    ok(f"已登录 {username or '(未知用户)'} @ {site}")
+    info(f"配置保存在 {global_config_path()}")
+
+
+def _read_multiline_cookie() -> str:
+    print("Cookie（可粘贴一行 header，或整段 JSON；输入空行结束）:")
+    lines: List[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line.strip() and lines:
+            break
+        if not line.strip() and not lines:
+            return ""
+        lines.append(line)
+        blob = "\n".join(lines).strip()
+        if blob.startswith("{") and blob.count("{") <= blob.count("}"):
+            try:
+                json.loads(blob)
+                break
+            except json.JSONDecodeError:
+                continue
+    return "\n".join(lines).strip()
+
+
+def cmd_login(args: argparse.Namespace) -> None:
+    cfg = load_global()
+    site = (args.site or cfg.get("site") or DEFAULT_SITE).rstrip("/")
+    ua = args.user_agent or cfg.get("user_agent") or DEFAULT_UA
+    cookie = args.cookie
+    if args.cookie_file:
+        cookie = Path(args.cookie_file).read_text(encoding="utf-8").strip()
+
+    if not cookie and not args.username and not args.manual:
+        prev = cfg.get("username") or ""
+        if prev:
+            info(f"本地当前是 {prev}，先退出再登录新账号")
+        _forget_saved_login(cfg)
+        cookie, ua, html = login_via_browser(site)
+        fallback = extract_username(html) or cookie_names(cookie).get("uoj_username") or ""
+        _finalize_login(cfg, site, cookie, ua, args.debug, fallback_user=fallback)
+        return
+
+    if not cookie and not args.username:
+        print("手动粘贴 Cookie。有 cf_clearance 时必须同时提供同一浏览器的 User-Agent。")
+        cookie = _read_multiline_cookie()
+        ua_in = input("User-Agent（有 cf_clearance 时必填）: ").strip()
+        if ua_in:
+            ua = ua_in
+    if cookie:
+        cookie = parse_cookie_input(cookie)
+        names = cookie_names(cookie)
+        if "cf_clearance" in names and ua == DEFAULT_UA:
+            die(
+                "Cookie 里有 cf_clearance，但 User-Agent 还是脚本默认值。\n"
+                "请使用弹出窗口登录:  python submit login\n"
+                "或加上 --user-agent"
+            )
+        if "UOJSESSID" not in names and "uoj_remember_token" not in names:
+            warn("没有看到 UOJSESSID / uoj_remember_token，登录可能失败")
+        _finalize_login(
+            cfg,
+            site,
+            cookie,
+            ua,
+            args.debug,
+            fallback_user=names.get("uoj_username") or "",
+        )
+        return
+
+    username = args.username or input("用户名: ").strip()
+    password = args.password or getpass.getpass("密码: ")
+    if not username or not password:
+        die("用户名和密码不能为空")
+    client = Client(site, user_agent=ua, debug=args.debug)
+    status, url, page = client.get("/login")
+    token = extract_token(page)
+    if not token:
+        warn("没有解析到 CSRF token，仍尝试登录")
+    hashed = md5_hex(password)
+    fields = {
+        "_token": token,
+        "login": "",
+        "username": username,
+        "password": hashed,
+    }
+    status, url, resp = client.post_form("/login", fields, referer=urljoin(site, "/login"))
+    if resp.strip() != "ok":
+        fields["password"] = hmac_md5_hex(token, password)
+        status, url, resp = client.post_form("/login", fields, referer=urljoin(site, "/login"))
+    if resp.strip() != "ok":
+        fields["password"] = password
+        status, url, resp = client.post_form("/login", fields, referer=urljoin(site, "/login"))
+    if resp.strip() != "ok":
+        die(
+            "用户名密码登录失败（QOJ 有 Cloudflare）。请改用窗口登录:\n"
+            f"  python submit login\n服务器返回: {resp.strip()[:200]!r}"
+        )
+    status, url, home = client.get("/")
+    handle = extract_username(home) or username
+    cfg.update({
+        "site": site,
+        "cookie": client.cookie_header(),
+        "user_agent": ua,
+        "username": handle,
+    })
+    save_global(cfg)
+    ok(f"已登录 {handle} @ {site}")
+    info(f"配置保存在 {global_config_path()}")
+
+
+def cmd_logout(_args: argparse.Namespace) -> None:
+    cfg = load_global()
+    old = cfg.get("username") or cookie_names(cfg.get("cookie") or "").get("uoj_username") or ""
+    _forget_saved_login(cfg)
+    if old:
+        ok(f"已退出 {old}")
+    else:
+        ok("已清除本地登录")
+    info("换账号: python3 submit login")
+
+
+def cmd_whoami(args: argparse.Namespace) -> None:
+    cfg = load_global()
+    client = make_client(cfg, debug=args.debug)
+    status, url, page = client.get("/")
+    expect = cfg.get("username") or cookie_names(cfg.get("cookie") or "").get("uoj_username") or ""
+    if not looks_logged_in(page, url, expect=expect):
+        die("当前 Cookie 未登录")
+    username = extract_username(page) or expect or "?"
+    ok(f"{username} @ {client.site}")
+
+
+def parse_contest_ref(raw: str, cfg: dict, site_override: Optional[str] = None) -> Tuple[str, str]:
+    text = (raw or "").strip()
+    m = re.search(r"(https?://[^/]+)/contest/(\d+)", text)
+    if m:
+        return m.group(1).rstrip("/"), m.group(2)
+    if re.fullmatch(r"\d+", text):
+        site = (site_override or cfg.get("site") or DEFAULT_SITE).rstrip("/")
+        return site, text
+    die("请输入比赛 UID，例如 1234")
+    raise AssertionError
+
+
+def bind_contest(
+    raw: str,
+    *,
+    site: Optional[str] = None,
+    start: bool = True,
+    template: bool = False,
+    debug: bool = False,
+    quiet: bool = False,
+) -> dict:
+    cfg = load_global()
+    site, contest_id = parse_contest_ref(raw, cfg, site)
+    contest_url = f"{site}/contest/{contest_id}"
+    client = make_client(cfg, {"site": site}, debug=debug)
+    status, url, page = client.get(contest_url)
+    if not looks_logged_in(page, url, expect=cfg.get("username") or "") and "/login" in url:
+        die("未登录或 Cookie 失效，请先 python3 submit login")
+
+    if start or _vp_needs_start(page):
+        if _vp_needs_start(page):
+            info("检测到尚未开始 VP，正在尝试 Start...")
+            page = _start_virtual(client, contest_url, page)
+            status, url, page = client.get(contest_url)
+
+    problems = parse_contest_problems(page, site, contest_id)
+    if not problems:
+        die(
+            "没有解析到题目。请确认:\n"
+            "  1) 已经登录\n"
+            "  2) 比赛 UID 正确\n"
+            "  3) 如需 VP，可在网页点 Start 后再试"
+        )
+    name = parse_contest_name(page) or f"Contest {contest_id}"
+    username = extract_username(page) or cfg.get("username") or ""
+    data = {
+        "site": site,
+        "contest_id": contest_id,
+        "contest_url": contest_url,
+        "name": name,
+        "username": username,
+        "problems": problems,
+    }
+    dest_dir = Path.cwd()
+    contest_path = dest_dir / CONTEST_FILE
+    save_json(contest_path, data)
+    cfg["site"] = site
+    cfg["contest"] = data
+    save_global(cfg)
+    copied = copy_self_to(dest_dir)
+    if template:
+        _write_templates(dest_dir, problems.keys())
+    if not quiet:
+        ok(f"已绑定比赛: {name}")
+        info(f"UID: {contest_id}  {contest_url}")
+        info(f"配置: {contest_path}")
+        if copied:
+            info(f"提交命令: {copied}")
+        _print_problems(problems)
+        print()
+        info("接下来:  python3 submit a.cpp")
+    return data
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    bind_contest(
+        args.url,
+        site=getattr(args, "site", None),
+        start=not getattr(args, "no_start", False),
+        template=bool(getattr(args, "template", False)),
+        debug=bool(getattr(args, "debug", False)),
+    )
+
+
+def _page_title(page: str) -> str:
+    m = re.search(r"<title>(.*?)</title>", page, re.I | re.S)
+    return strip_html(m.group(1)) if m else ""
+
+
+def _is_cloudflare_block(page: str) -> bool:
+    """True only for a full-page Cloudflare interstitial, not CF scripts on a real QOJ page."""
+    title = _page_title(page).lower()
+    if "just a moment" in title or title.strip() == "attention required!":
+        return True
+    if re.search(r'id=["\'](?:challenge-running|challenge-error-title)["\']', page, re.I):
+        if looks_logged_in(page) or re.search(r'id=["\']form-login["\']', page, re.I):
+            return False
+        return True
+    head = strip_html(page)[:500].lower()
+    if "checking your browser before accessing" in head:
+        return True
+    if "verify you are human" in head and "qoj" not in title:
+        return True
+    return False
+
+
+def _has_submit_form(page: str) -> bool:
+    if re.search(r"<textarea\b[^>]*name=[\"']answer_answer_editor[\"']", page, re.I):
+        return True
+    if re.search(r"<select\b[^>]*name=[\"'][^\"']*answer[^\"']*language[\"']", page, re.I):
+        return True
+    if re.search(r"<(?:input|button)\b[^>]*name=[\"']submit-answer[\"']", page, re.I):
+        return True
+    return False
+
+
+def _fetch_problem_submit_page(
+    client: Client,
+    contest: dict,
+    problem: dict,
+    on_fetch=None,
+) -> Tuple[str, int, str, str]:
+    """Return (post_url, status, final_url, html). post_url is where the Submit form posts."""
+    site = contest.get("site") or client.site
+    contest_id = str(contest.get("contest_id") or "")
+    pid = str(problem.get("id") or "")
+    base = canonical_problem_url(problem.get("url") or "")
+    if not re.search(r"/problem/\d+$", base):
+        base = f"{site.rstrip('/')}/contest/{contest_id}/problem/{pid}"
+    seen: set = set()
+    queue = problem_page_candidates(base, site, contest_id, pid)
+    last = (404, base, "")
+    best_post = base
+    best_page = ""
+    best_final = base
+    best_status = 404
+    while queue and len(seen) < 12:
+        url = queue.pop(0)
+        if url in seen:
+            continue
+        seen.add(url)
+        if on_fetch:
+            on_fetch(url)
+        status, final, page = client.get(url, timeout=15, retries=0)
+        last = (status, final, page)
+        for extra in iter_submit_hrefs(page, final or url):
+            if extra not in seen:
+                queue.append(extra)
+        action = extract_form_action(page, final or url)
+        if extract_token(page):
+            post_to = action or (final or url).split("#")[0]
+            return post_to, status, final, page
+        if not best_page and looks_logged_in(page, final):
+            best_post = action or (final or url).split("#")[0]
+            best_page = page
+            best_final = final
+            best_status = status
+    if best_page:
+        return best_post, best_status, best_final, best_page
+    status, final, page = last
+    return (final or base).split("#")[0], status, final, page
+
+
+def _vp_needs_start(page: str) -> bool:
+    if re.search(r"you can start your participation", page, re.I):
+        return True
+    if "开始参赛" in page or "开始虚拟" in page:
+        return True
+    if re.search(r'name=["\']submit-start_virtual["\']', page, re.I):
+        return True
+    if re.search(r'name=["\'][^"\']*start_virtual[^"\']*["\']', page, re.I):
+        return True
+    low = page.lower()
+    hints = (
+        "start your participation",
+        "start virtual",
+    )
+    if any(h in low for h in hints):
+        if re.search(r"submit-start|start_virtual|start-virtual", page, re.I):
+            return True
+        if re.search(r">\s*Start!?\s*<", page, re.I) or "Start!" in page:
+            return True
+    return False
+
+
+def _explain_missing_submit(
+    status: int, url: str, page: str, contest_url: str, expect: str = ""
+) -> str:
+    title = _page_title(page)
+    snippet = re.sub(r"\s+", " ", strip_html(page))[:240]
+    lines = [f"打不开提交页 (HTTP {status}, {url})"]
+    if title:
+        lines.append(f"页面标题: {title}")
+    if _is_cloudflare_block(page):
+        lines.append("原因: Cloudflare 拦截。请重新: python3 submit login")
+    elif "/login" in (url or "") or re.search(r'id=["\']form-login["\']', page, re.I):
+        lines.append("原因: 未登录或 Cookie 已过期。网页里 Start VP 不会带到命令行。")
+        lines.append("请先: python3 submit login")
+        lines.append("然后: python3 submit whoami")
+    elif _vp_needs_start(page):
+        lines.append("原因: 这个账号还没 Start VP。请: python3 submit start")
+        lines.append(f"或浏览器打开: {contest_url}")
+    elif not looks_logged_in(page, url, expect=expect):
+        lines.append("原因: 页面看起来未登录。请: python3 submit whoami")
+    else:
+        lines.append("已登录，但题目页没有提交表单。多半还没 Start VP，或这题不能命令行交。")
+        lines.append(f"请用浏览器打开题目，确认能看到 Submit: {url}")
+    if snippet:
+        lines.append(f"页面摘要: {snippet}")
+    return "\n".join(lines)
+
+
+def _ensure_logged_in_and_vp(client: Client, contest: dict, expect: str = "") -> None:
+    contest_url = contest["contest_url"]
+    status, url, page = client.get(contest_url)
+    if _is_cloudflare_block(page):
+        die("被 Cloudflare 拦截。请重新: python3 submit login")
+    if not looks_logged_in(page, url, expect=expect):
+        die(
+            "当前 Cookie 未登录或已过期。浏览器里点的 Start VP 不会带到这里。\n"
+            "请先: python3 submit login\n"
+            "然后: python3 submit whoami"
+        )
+    if _vp_needs_start(page):
+        info("尚未 Start VP，正在自动开始...")
+        _start_virtual(client, contest_url, page)
+        status, url, page = client.get(contest_url)
+        if _vp_needs_start(page):
+            die(
+                "自动 Start VP 失败。请在浏览器打开比赛页点 Start 后再提交:\n"
+                f"  {contest_url}"
+            )
+
+
+def _start_virtual(client: Client, contest_url: str, page: str) -> str:
+    token = extract_token(page)
+    button = None
+    for pat in (
+        r'name=["\'](submit-[^"\']*virtual[^"\']*)["\']',
+        r'name=["\'](submit-start[^"\']*)["\']',
+        r'name=["\']([^"\']*start_virtual[^"\']*)["\']',
+    ):
+        m = re.search(pat, page, re.I)
+        if m:
+            button = m.group(1)
+            break
+    fields = {"_token": token}
+    if button:
+        vm = re.search(
+            rf'name=["\']{re.escape(button)}["\'][^>]*value=["\']([^"\']*)["\']',
+            page,
+            re.I,
+        )
+        fields[button] = vm.group(1) if vm else "start"
+    else:
+        fields["submit-start_virtual"] = "start_virtual"
+    status, url, resp = client.post_form(contest_url, fields, referer=contest_url)
+    if _vp_needs_start(resp):
+        warn("自动开始 VP 可能失败，请在浏览器打开比赛页点 Start")
+    else:
+        ok("已开始 Virtual Participation")
+    return resp
+
+
+def _write_templates(dest_dir: Path, letters: Iterable[str]) -> None:
+    for letter in letters:
+        path = dest_dir / f"{letter.lower()}.cpp"
+        if path.exists():
+            continue
+        path.write_text(CPP_TEMPLATE, encoding="utf-8")
+        info(f"已创建模板 {path.name}")
+
+
+def _print_problems(problems: dict) -> None:
+    print()
+    print(paint("  #   ID        Title", "1"))
+    for letter in sorted(problems, key=lambda x: (len(x), x)):
+        p = problems[letter]
+        print(f"  {letter:<3} {p['id']:<9} {p['title']}")
+
+
+def cmd_start(args: argparse.Namespace) -> None:
+    cfg = load_global()
+    _, contest = require_contest()
+    client = make_client(cfg, contest, debug=args.debug)
+    url = contest["contest_url"]
+    status, _, page = client.get(url)
+    if not _vp_needs_start(page):
+        ok("VP 已经开始，或本场不需要 Start")
+        return
+    _start_virtual(client, url, page)
+
+
+def cmd_problems(args: argparse.Namespace) -> None:
+    _, contest = require_contest()
+    print(paint(contest.get("name", "Contest"), "1"), contest.get("contest_url", ""))
+    _print_problems(contest.get("problems") or {})
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    cfg = load_global()
+    _, contest = require_contest()
+    client = make_client(cfg, contest, debug=args.debug)
+    try:
+        rows = fetch_submission_rows(client, contest)
+    except (TimeoutError, OSError) as exc:
+        die(f"提交列表超时: {exc}\n请再试: ./submit status")
+        return
+    if not rows:
+        warn("没有提交记录（或解析失败）")
+        return
+    print(paint(f"{'ID':<10} {'Problem':<28} Result", "1"))
+    for row in rows[: args.limit]:
+        print(f"{row['id']:<10} {row['problem'][:28]:<28} {verdict_color(row['status'])}")
+
+
+def resolve_source(name: str) -> Path:
+    path = Path(name)
+    if path.is_file():
+        return path
+    if path.suffix:
+        die(f"文件不存在: {name}")
+    for ext in EXT_CANDIDATES:
+        cand = Path(name + ext)
+        if cand.is_file():
+            return cand
+        cand = Path(name.lower() + ext)
+        if cand.is_file():
+            return cand
+        cand = Path(name.upper() + ext)
+        if cand.is_file():
+            return cand
+    die(f"找不到源文件 {name} / {name}.cpp / {name}.py ...")
+    raise AssertionError
+
+
+def letter_from_filename(path: Path, problems: dict, explicit: Optional[str]) -> str:
+    if explicit:
+        letter = explicit.strip().upper()
+        if letter not in problems:
+            die(f"没有题目 {letter}。已有: {', '.join(sorted(problems, key=lambda x: (len(x), x)))}")
+        return letter
+    stem = path.stem
+    m = re.match(r"^([A-Za-z])", stem)
+    if not m:
+        die("无法从文件名判断题号，请使用 a.cpp / b.cpp，或加 --problem A")
+    letter = m.group(1).upper()
+    if letter not in problems:
+        die(
+            f"文件 {path.name} 对应题目 {letter}，但本场没有这题。\n"
+            f"已有: {', '.join(sorted(problems, key=lambda x: (len(x), x)))}"
+        )
+    return letter
+
+
+def submissions_list_urls(contest: dict, problem_id: Optional[str] = None) -> List[str]:
+    username = contest.get("username") or ""
+    site = (contest.get("site") or "").rstrip("/")
+    contest_url = contest["contest_url"].rstrip("/")
+    params = {}
+    if username:
+        params["submitter"] = username
+    if problem_id:
+        params["problem_id"] = problem_id
+    q = ("?" + urlencode(params)) if params else ""
+    urls = [
+        contest_url + "/submissions" + q,
+        site + "/submissions" + q,
+    ]
+    if problem_id:
+        params2 = dict(params)
+        params2.pop("problem_id", None)
+        q2 = ("?" + urlencode(params2)) if params2 else ""
+        urls.append(contest_url + "/submissions" + q2)
+    out: List[str] = []
+    for item in urls:
+        if item not in out:
+            out.append(item)
+    return out
+
+
+def fetch_submission_rows(
+    client: Client,
+    contest: dict,
+    problem_id: Optional[str] = None,
+    timeout: int = 10,
+    retries: int = 0,
+) -> List[dict]:
+    last_err: Optional[BaseException] = None
+    for url in submissions_list_urls(contest, problem_id)[:2]:
+        try:
+            _, _, page = client.get(url, timeout=timeout, retries=retries, fatal=False)
+        except (TimeoutError, OSError) as exc:
+            last_err = exc
+            continue
+        rows = parse_submission_rows(page)
+        if rows:
+            return rows
+    if last_err:
+        raise last_err
+    return []
+
+
+def latest_ids(client: Client, contest: dict, problem_id: Optional[str] = None) -> List[str]:
+    return [r["id"] for r in fetch_submission_rows(client, contest, problem_id)]
+
+
+def wait_for_new_sid(
+    client: Client,
+    contest: dict,
+    problem_id: str,
+    before: List[str],
+    seconds: float = 8,
+) -> Optional[str]:
+    info("正在确认提交号...")
+    known = set(before)
+    deadline = time.time() + seconds
+    last_talk = 0.0
+    while time.time() < deadline:
+        try:
+            after = latest_ids(client, contest, problem_id)
+        except (TimeoutError, OSError):
+            time.sleep(0.8)
+            continue
+        for item in after:
+            if item not in known:
+                return item
+        now = time.time()
+        if now - last_talk > 5:
+            info("还没有看到新提交，继续查...")
+            last_talk = now
+        time.sleep(0.6)
+    return None
+
+
+def format_ago(ts: float) -> str:
+    try:
+        delta = int(time.time() - ts)
+    except (TypeError, OverflowError, OSError):
+        return "?"
+    if delta < 0:
+        return "刚刚"
+    if delta < 5:
+        return "刚刚"
+    if delta < 60:
+        return f"{delta} 秒前"
+    if delta < 3600:
+        return f"{delta // 60} 分钟前"
+    if delta < 86400:
+        hours, minutes = divmod(delta // 60, 60)
+        if minutes:
+            return f"{hours} 小时 {minutes} 分钟前"
+        return f"{hours} 小时前"
+    days = delta // 86400
+    return f"{days} 天前"
+
+
+def file_mtime(path: Path) -> str:
+    try:
+        return format_ago(path.stat().st_mtime)
+    except OSError:
+        return "?"
+
+
+def cached_last_submit(contest: dict, problem_id: str) -> Tuple[str, Optional[float]]:
+    rec = (contest.get("last_submit") or {}).get(str(problem_id)) or {}
+    sid = str(rec.get("sid") or "")
+    try:
+        ts = float(rec["ts"]) if rec.get("ts") is not None else None
+    except (TypeError, ValueError):
+        ts = None
+    return sid, ts
+
+
+def remember_submit(contest_path: Path, contest: dict, problem_id: str, sid: str) -> None:
+    rec = contest.setdefault("last_submit", {})
+    rec[str(problem_id)] = {"sid": str(sid), "ts": time.time()}
+    if contest_path.name == CONTEST_FILE:
+        try:
+            save_json(contest_path, contest)
+        except OSError:
+            pass
+    cfg = load_global()
+    cached = cfg.get("contest")
+    if isinstance(cached, dict) and str(cached.get("contest_id")) == str(contest.get("contest_id")):
+        cfg["contest"] = contest
+        save_global(cfg)
+
+
+def confirm_or_abort(prompt: str = "确认提交? [Y/n] ") -> None:
+    try:
+        ans = input(prompt).strip().lower()
+    except EOFError:
+        ans = ""
+    if ans in ("n", "no", "q", "quit"):
+        die("已取消")
+
+
+def _load_submit_context(
+    client: Client,
+    contest: dict,
+    problem: dict,
+    expect: str,
+    on_fetch=None,
+) -> Tuple[str, int, str, str, List[str], bool, str, Optional[float]]:
+    problem_url, status, url, page = _fetch_problem_submit_page(
+        client, contest, problem, on_fetch=on_fetch
+    )
+    if _is_cloudflare_block(page):
+        die("被 Cloudflare 拦截。请重新: python3 submit login")
+    if not looks_logged_in(page, url, expect=expect) or _vp_needs_start(page):
+        _ensure_logged_in_and_vp(client, contest, expect=expect)
+        if not extract_token(page) or _vp_needs_start(page):
+            problem_url, status, url, page = _fetch_problem_submit_page(
+                client, contest, problem, on_fetch=on_fetch
+            )
+    before: List[str] = []
+    last_sid, last_ts = "", None
+    list_timeout = False
+    try:
+        if on_fetch:
+            on_fetch("submissions")
+        rows = fetch_submission_rows(client, contest, problem["id"])
+        before = [r["id"] for r in rows]
+        if rows:
+            last_sid = rows[0]["id"]
+            last_ts = rows[0].get("submit_ts")
+    except (TimeoutError, OSError):
+        list_timeout = True
+    return problem_url, status, url, page, before, list_timeout, last_sid, last_ts
+
+
+def cmd_submit(args: argparse.Namespace) -> None:
+    cfg = load_global()
+    if getattr(args, "contest", None):
+        bind_contest(str(args.contest), start=True, debug=bool(args.debug), quiet=True)
+    contest_path, contest = require_contest()
+    problems = contest.get("problems") or {}
+    if not problems:
+        die("比赛配置里没有题目。请先: python3 submit 1234")
+    src = resolve_source(args.file)
+    letter = letter_from_filename(src, problems, args.problem)
+    problem = problems[letter]
+    suffix = src.suffix.lower()
+    try:
+        code = src.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        code = src.read_text(encoding="gbk")
+    if not code.strip():
+        die(f"{src.name} 是空文件")
+
+    lang_field, options = "answer_answer_language", list(DEFAULT_QOJ_LANGS)
+    lang = pick_language(options, suffix, args.lang)
+
+    try:
+        mtime = src.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    cached_sid, cached_ts = cached_last_submit(contest, problem["id"])
+
+    print(paint("== submit ==", "1"), flush=True)
+    print(f"  contest  {contest.get('name')}", flush=True)
+    print(f"  problem  {letter}  {problem['title']}  (#{problem['id']})", flush=True)
+    print(f"  file     {src}", flush=True)
+    print(f"  mtime    {file_mtime(src)}", flush=True)
+    print(f"  lang     {lang}", flush=True)
+    warned_stale = False
+    if cached_ts is not None and mtime and mtime <= cached_ts + 1:
+        warn(f"文件上次修改早于上次提交 #{cached_sid or '?'}，可能是旧代码")
+        warned_stale = True
+    if args.dry_run:
+        warn("dry-run，没有真正提交")
+        return
+
+    client = make_client(cfg, contest, debug=args.debug)
+    expect = contest.get("username") or cfg.get("username") or ""
+    talk = {"on": False}
+
+    def on_fetch(what: str) -> None:
+        if not talk["on"]:
+            return
+        if what == "submissions":
+            info("正在读取提交记录...")
+        else:
+            info(f"正在打开 {what}")
+
+    box: dict = {"data": None, "exc": None}
+
+    def _prefetch() -> None:
+        try:
+            box["data"] = _load_submit_context(
+                client, contest, problem, expect, on_fetch=on_fetch
+            )
+        except BaseException as exc:
+            box["exc"] = exc
+
+    worker = threading.Thread(target=_prefetch, daemon=True)
+    worker.start()
+    if not getattr(args, "yes", False):
+        confirm_or_abort()
+    talk["on"] = True
+    if worker.is_alive():
+        info("正在打开提交页...")
+    worker.join()
+    if box["exc"] is not None:
+        exc = box["exc"]
+        if isinstance(exc, SystemExit):
+            raise exc
+        raise exc
+    problem_url, status, url, page, before, list_timeout, list_sid, list_ts = box["data"]
+    if list_timeout:
+        warn("拉取提交列表超时，仍继续提交")
+    if not warned_stale and list_ts is not None and mtime and mtime <= list_ts + 1:
+        warn(f"文件上次修改早于上次提交 #{list_sid or '?'}，可能是旧代码")
+    token = extract_token(page)
+    if not token:
+        die("没有拿到 CSRF token，页面可能不是提交页")
+    if re.search(r'name=["\']answer_Anna_language["\']', page):
+        die("这是交互/通信题（Anna/Bruno），请到网页提交")
+    parsed_field, parsed_opts = collect_language_options(page)
+    if parsed_opts:
+        lang_field, options = parsed_field, parsed_opts
+        lang = pick_language(options, suffix, args.lang)
+    btn_name, btn_val = extract_submit_button(page)
+
+    post_candidates: List[str] = []
+    for item in (
+        problem_url,
+        url.split("#")[0] if url else "",
+        extract_form_action(page, url or problem_url),
+        canonical_problem_url(problem_url) + "?tab=submit-answer",
+        canonical_problem_url(problem_url) + "/submit",
+        (url or problem_url).split("#")[0],
+    ):
+        item = (item or "").split("#")[0]
+        if item and item not in post_candidates:
+            post_candidates.append(item)
+
+    info("正在提交...")
+    fields = {
+        "_token": token,
+        lang_field: lang,
+        "answer_answer_upload_type": "editor",
+        "answer_answer_editor": code,
+        btn_name: btn_val,
+    }
+    files = {
+        "answer_answer_file": ("", b"", "application/octet-stream"),
+    }
+    status, resp_url, resp = 0, "", ""
+    used_post = post_candidates[0]
+    timed_out = False
+    for post_url in post_candidates:
+        used_post = post_url
+        info(f"POST {post_url}")
+        try:
+            status, resp_url, resp = client.post_multipart(
+                post_url, fields, files=files, referer=url or post_url, fatal=False
+            )
+        except TimeoutError:
+            warn("提交响应超时，正在查是否已经交上去（不要重复提交）...")
+            client._rebuild_opener()
+            timed_out = True
+            status, resp_url, resp = 0, "", ""
+            break
+        bounced = status in (301, 302, 303) and "/statement/" in (resp_url or "")
+        if bounced:
+            warn("这个地址会跳回题面，换 Submit 地址再试")
+            continue
+        break
+    else:
+        die(
+            "提交一直被重定向到题面页。QOJ 需要先打开题目再点 Submit。\n"
+            "请把浏览器地址栏在点击 Submit 之后的完整 URL 发过来。"
+        )
+    url = resp_url
+    if not timed_out:
+        info(f"服务器已响应 HTTP {status}")
+        alert = extract_alerts(resp)
+        if alert:
+            die(f"提交被拒绝: {alert}")
+        if "/login" in (url or ""):
+            die("提交时登录已失效，请 python3 submit login")
+        if status in (301, 302, 303) and "/statement/" in (url or ""):
+            die(
+                "提交被重定向到题面页，请求没有当成交题处理。\n"
+                "请在浏览器打开题目，点 Submit 确认能交，然后 ./submit status"
+            )
+        if status >= 400:
+            die(f"提交 HTTP {status}  {url}")
+
+    sid = None
+    loc_sid = re.search(r"/submission/(\d+)", url or "")
+    if loc_sid:
+        sid = loc_sid.group(1)
+    from_resp = [r["id"] for r in parse_submission_rows(resp)]
+    if not sid and ("/submissions" in (url or "") or "/submission/" in (url or "")):
+        for item in from_resp:
+            if item not in before:
+                sid = item
+                break
+        if not sid and from_resp:
+            sid = from_resp[0]
+    if not sid:
+        sid = wait_for_new_sid(
+            client, contest, problem["id"], before, seconds=20 if timed_out else 8
+        )
+
+    if sid and sid not in before:
+        board = f"{contest['contest_url'].rstrip('/')}/submissions"
+        ok(f"已提交 #{sid}")
+        remember_submit(contest_path, contest, problem["id"], sid)
+        info(f"评测结果见 {board}")
+        return
+    if sid and sid in before:
+        die(
+            f"没有交上去。提交列表还是原来的 #{sid}。\n"
+            f"最终 URL: {url}\n"
+            f"标题: {_page_title(resp) or '(无)'}\n"
+            "请 ./submit status 核对，不要连续重复提交。"
+        )
+    die(
+        "没有交上去（提交响应超时或没有新的提交记录）。\n"
+        f"HTTP {status}  {url}\n"
+        f"标题: {_page_title(resp) or '(无)'}\n"
+        "请先 ./submit status 核对，不要连续重复提交。"
+    )
+
+
+def watch_submission(_client, contest: dict, sid: str, timeout: int = 300) -> None:
+    sid = str(sid).lstrip("#")
+    url = f"{contest['contest_url'].rstrip('/')}/submissions"
+    info(f"评测结果见 {url}")
+
+
+def cmd_watch(args: argparse.Namespace) -> None:
+    _, contest = require_contest()
+    watch_submission(None, contest, str(args.id).lstrip("#"))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="submit",
+        description="QOJ VP 的 XCPC 风格命令行提交插件: ./submit a.cpp",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""例子:
+  python3 submit login
+  python3 submit 1234
+  python3 submit a.cpp
+  python3 submit b.py --lang PyPy3
+  python3 submit status
+""",
+    )
+    p.add_argument("--debug", action="store_true", help="打印 HTTP 请求")
+    p.add_argument("--version", action="version", version=f"{APP_NAME} {VERSION}")
+    sub = p.add_subparsers(dest="cmd")
+
+    pl = sub.add_parser("login", help="弹出登录窗口（推荐）")
+    pl.add_argument("--site", default=None, help="OJ 地址，默认 https://qoj.ac")
+    pl.add_argument("--cookie", default=None, help="Cookie 字符串")
+    pl.add_argument("--cookie-file", default=None, help="包含 Cookie 的文件")
+    pl.add_argument("--user-agent", default=None, help="浏览器 User-Agent")
+    pl.add_argument("-u", "--username", default=None)
+    pl.add_argument("-p", "--password", default=None)
+    pl.add_argument("--manual", action="store_true", help="改用手动粘贴 Cookie")
+
+    sub.add_parser("logout", help="退出本地登录，以便换账号")
+    sub.add_parser("whoami", help="检查当前登录")
+
+    pi = sub.add_parser("init", aliases=["contest"], help="用比赛 UID 绑定比赛")
+    pi.add_argument("url", help="比赛 UID 或 URL，例如 1234")
+    pi.add_argument("--site", default=None)
+    pi.add_argument("--no-start", action="store_true", help="不要自动开始 VP")
+    pi.add_argument("--template", action="store_true", help="生成 a.cpp b.cpp ... 模板")
+
+    sub.add_parser("start", help="开始 Virtual Participation")
+    sub.add_parser("problems", aliases=["list"], help="列出题目")
+
+    ps = sub.add_parser("status", help="最近提交")
+    ps.add_argument("-n", "--limit", type=int, default=15)
+
+    pw = sub.add_parser("watch", help="跟踪一次提交")
+    pw.add_argument("id", help="提交号")
+    pw.add_argument("--wait", type=int, default=300)
+
+    return p
+
+
+def looks_like_submit_target(arg: str) -> bool:
+    if arg.startswith("-"):
+        return False
+    commands = {
+        "login", "logout", "init", "start", "problems", "list", "status",
+        "watch", "whoami", "help",
+    }
+    if arg in commands:
+        return False
+    path = Path(arg)
+    if path.suffix.lower() in EXT_LANG_PREFER or path.suffix.lower() in EXT_CANDIDATES:
+        return True
+    if path.exists():
+        return True
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_\-]*", arg) and len(arg) <= 32:
+        return True
+    return False
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    debug = False
+    if "--debug" in argv:
+        debug = True
+        argv = [a for a in argv if a != "--debug"]
+
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        parser.print_help()
+        return
+
+    if looks_like_submit_target(argv[0]):
+        sp = argparse.ArgumentParser(prog="submit")
+        sp.add_argument("file")
+        sp.add_argument("-p", "--problem", default=None, help="题号，如 A")
+        sp.add_argument("-l", "--lang", default=None, help="语言，如 C++20")
+        sp.add_argument("-c", "--contest", default=None, help="比赛 UID")
+        sp.add_argument("-y", "--yes", action="store_true", help="不询问，直接提交")
+        sp.add_argument("-n", "--no-wait", action="store_true", help="提交后不等待结果")
+        sp.add_argument("--wait", type=int, default=300)
+        sp.add_argument("--dry-run", action="store_true")
+        args = sp.parse_args(argv)
+        args.debug = debug
+        cmd_submit(args)
+        return
+
+    if re.fullmatch(r"\d+", argv[0]):
+        uid = argv[0]
+        rest = argv[1:]
+        template = "--template" in rest
+        rest = [a for a in rest if a != "--template"]
+        bind_contest(uid, start=True, template=template, debug=debug)
+        if rest and looks_like_submit_target(rest[0]):
+            sp = argparse.ArgumentParser(prog="submit")
+            sp.add_argument("file")
+            sp.add_argument("-p", "--problem", default=None)
+            sp.add_argument("-l", "--lang", default=None)
+            sp.add_argument("-y", "--yes", action="store_true")
+            sp.add_argument("-n", "--no-wait", action="store_true")
+            sp.add_argument("--wait", type=int, default=300)
+            sp.add_argument("--dry-run", action="store_true")
+            args = sp.parse_args(rest)
+            args.debug = debug
+            args.contest = None
+            cmd_submit(args)
+        return
+
+    args = parser.parse_args(argv)
+    args.debug = bool(getattr(args, "debug", False) or debug)
+    if args.cmd == "login":
+        args.debug = debug
+        cmd_login(args)
+    elif args.cmd == "logout":
+        cmd_logout(args)
+    elif args.cmd == "whoami":
+        cmd_whoami(args)
+    elif args.cmd in ("init", "contest"):
+        cmd_init(args)
+    elif args.cmd == "start":
+        cmd_start(args)
+    elif args.cmd in ("problems", "list"):
+        cmd_problems(args)
+    elif args.cmd == "status":
+        cmd_status(args)
+    elif args.cmd == "watch":
+        cmd_watch(args)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

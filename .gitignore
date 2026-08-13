@@ -1,0 +1,31 @@
+.venv/
+__pycache__/
+gcm-diagnose.log
+*.pyc
+*.pyo
+
+# local login / contest state
+.qoj.json
+cookie
+cookies.json
+config.json
+.env
+
+# local solutions
+submission/
+*.cpp
+*.cc
+*.cxx
+*.c
+*.py
+!install.sh
+
+# latex build
+*.pdf
+*.log
+*.aux
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz

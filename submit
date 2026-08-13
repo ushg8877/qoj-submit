@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""XCPC-style command-line submit plugin for QOJ (qoj.ac) VP contests.
+"""XCPC-style command-line submit plugin for QOJ (qoj.ac).
 
 Usage during a contest:
   ./submit a.cpp      submit problem A
@@ -850,7 +850,7 @@ def collect_language_options(page: str) -> Tuple[str, List[Tuple[str, str]]]:
 
 def pick_language(options: List[Tuple[str, str]], suffix: str, explicit: Optional[str] = None) -> str:
     if not options:
-        die("题目页没有语言选项，可能未登录或还没开始 VP")
+        die("题目页没有语言选项，可能未登录或没有提交表单")
     if explicit:
         want = norm_lang(explicit)
         for value, label in options:
@@ -1036,10 +1036,23 @@ def parse_submission_rows(page: str) -> List[dict]:
             r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', tr, re.I | re.S
         )]
         problem = ""
+        problem_id = ""
+        contest_id = ""
+        submitter = ""
         for href, text in links:
-            if "/problem/" in href:
-                problem = text
-                break
+            if not contest_id:
+                cm = re.search(r"/contest/(\d+)", href)
+                if cm:
+                    contest_id = cm.group(1)
+            if not problem_id:
+                pm = re.search(r"/problem/(\d+)", href)
+                if pm:
+                    problem_id = pm.group(1)
+                    problem = text
+            if not submitter:
+                um = re.search(r"/user/profile/([^/?#'\"]+)", href)
+                if um:
+                    submitter = htmlmod.unescape(um.group(1))
         cells = [strip_html(td) for td in re.findall(r"<td\b[^>]*>(.*?)</td>", tr, re.I | re.S)]
         status = _uoj_status_text(tr)
         if not status:
@@ -1056,12 +1069,56 @@ def parse_submission_rows(page: str) -> List[dict]:
         rows.append({
             "id": sid,
             "problem": problem,
+            "problem_id": problem_id,
+            "contest_id": contest_id,
+            "submitter": submitter,
             "status": status or "?",
             "cells": cells,
             "submit_ts": _parse_submit_clock(cells),
             "url_path": f"/submission/{sid}",
         })
     return rows
+
+
+def _contest_problem_ids(contest: dict) -> set:
+    ids = set()
+    for item in (contest.get("problems") or {}).values():
+        pid = str((item or {}).get("id") or "")
+        if pid:
+            ids.add(pid)
+    return ids
+
+
+def _contest_problem_label(contest: dict, row: dict) -> str:
+    pid = str(row.get("problem_id") or "")
+    for letter, item in (contest.get("problems") or {}).items():
+        if str((item or {}).get("id") or "") == pid:
+            title = str((item or {}).get("title") or "").strip()
+            return f"{letter}. {title}" if title else str(letter)
+    return str(row.get("problem") or pid or "")
+
+
+def _submission_row_matches(
+    row: dict,
+    contest: dict,
+    problem_id: Optional[str] = None,
+) -> bool:
+    username = str(contest.get("username") or "")
+    submitter = str(row.get("submitter") or "")
+    if username and submitter and submitter != username:
+        return False
+    cid = str(contest.get("contest_id") or "")
+    row_cid = str(row.get("contest_id") or "")
+    if cid and row_cid and row_cid != cid:
+        return False
+    want = str(problem_id or "")
+    row_pid = str(row.get("problem_id") or "")
+    if want:
+        return (not row_pid) or row_pid == want
+    known = _contest_problem_ids(contest)
+    if known and row_pid:
+        return row_pid in known
+    return True
 
 
 def _parse_submit_clock(cells: List[str]) -> Optional[float]:
@@ -1368,7 +1425,7 @@ def require_contest() -> Tuple[Path, dict]:
         uid = ""
     if not uid:
         die("需要比赛 UID。先执行: python3 submit 1234")
-    data = bind_contest(uid, start=True)
+    data = bind_contest(uid)
     return Path.cwd() / CONTEST_FILE, data
 
 
@@ -2512,7 +2569,6 @@ def bind_contest(
     raw: str,
     *,
     site: Optional[str] = None,
-    start: bool = True,
     template: bool = False,
     debug: bool = False,
     quiet: bool = False,
@@ -2525,20 +2581,9 @@ def bind_contest(
     if not looks_logged_in(page, url, expect=cfg.get("username") or "") and "/login" in url:
         die("未登录或 Cookie 失效，请先 python3 submit login")
 
-    if start or _vp_needs_start(page):
-        if _vp_needs_start(page):
-            info("检测到尚未开始 VP，正在尝试 Start...")
-            page = _start_virtual(client, contest_url, page)
-            status, url, page = client.get(contest_url)
-
     problems = parse_contest_problems(page, site, contest_id)
     if not problems:
-        die(
-            "没有解析到题目。请确认:\n"
-            "  1) 已经登录\n"
-            "  2) 比赛 UID 正确\n"
-            "  3) 如需 VP，可在网页点 Start 后再试"
-        )
+        die("没有解析到题目。请确认已经登录，且比赛 UID 正确")
     name = parse_contest_name(page) or f"Contest {contest_id}"
     username = extract_username(page) or cfg.get("username") or ""
     data = {
@@ -2574,7 +2619,6 @@ def cmd_init(args: argparse.Namespace) -> None:
     bind_contest(
         args.url,
         site=getattr(args, "site", None),
-        start=not getattr(args, "no_start", False),
         template=bool(getattr(args, "template", False)),
         debug=bool(getattr(args, "debug", False)),
     )
@@ -2659,28 +2703,6 @@ def _fetch_problem_submit_page(
     return (final or base).split("#")[0], status, final, page
 
 
-def _vp_needs_start(page: str) -> bool:
-    if re.search(r"you can start your participation", page, re.I):
-        return True
-    if "开始参赛" in page or "开始虚拟" in page:
-        return True
-    if re.search(r'name=["\']submit-start_virtual["\']', page, re.I):
-        return True
-    if re.search(r'name=["\'][^"\']*start_virtual[^"\']*["\']', page, re.I):
-        return True
-    low = page.lower()
-    hints = (
-        "start your participation",
-        "start virtual",
-    )
-    if any(h in low for h in hints):
-        if re.search(r"submit-start|start_virtual|start-virtual", page, re.I):
-            return True
-        if re.search(r">\s*Start!?\s*<", page, re.I) or "Start!" in page:
-            return True
-    return False
-
-
 def _explain_missing_submit(
     status: int, url: str, page: str, contest_url: str, expect: str = ""
 ) -> str:
@@ -2692,72 +2714,15 @@ def _explain_missing_submit(
     if _is_cloudflare_block(page):
         lines.append("原因: Cloudflare 拦截。请重新: python3 submit login")
     elif "/login" in (url or "") or re.search(r'id=["\']form-login["\']', page, re.I):
-        lines.append("原因: 未登录或 Cookie 已过期。网页里 Start VP 不会带到命令行。")
-        lines.append("请先: python3 submit login")
-        lines.append("然后: python3 submit whoami")
-    elif _vp_needs_start(page):
-        lines.append("原因: 这个账号还没 Start VP。请: python3 submit start")
-        lines.append(f"或浏览器打开: {contest_url}")
+        lines.append("原因: 未登录或 Cookie 已过期。请先: python3 submit login")
     elif not looks_logged_in(page, url, expect=expect):
         lines.append("原因: 页面看起来未登录。请: python3 submit whoami")
     else:
-        lines.append("已登录，但题目页没有提交表单。多半还没 Start VP，或这题不能命令行交。")
-        lines.append(f"请用浏览器打开题目，确认能看到 Submit: {url}")
+        lines.append("题目页没有提交表单。请用浏览器打开题目，确认能看到 Submit。")
+        lines.append(f"  {url}")
     if snippet:
         lines.append(f"页面摘要: {snippet}")
     return "\n".join(lines)
-
-
-def _ensure_logged_in_and_vp(client: Client, contest: dict, expect: str = "") -> None:
-    contest_url = contest["contest_url"]
-    status, url, page = client.get(contest_url)
-    if _is_cloudflare_block(page):
-        die("被 Cloudflare 拦截。请重新: python3 submit login")
-    if not looks_logged_in(page, url, expect=expect):
-        die(
-            "当前 Cookie 未登录或已过期。浏览器里点的 Start VP 不会带到这里。\n"
-            "请先: python3 submit login\n"
-            "然后: python3 submit whoami"
-        )
-    if _vp_needs_start(page):
-        info("尚未 Start VP，正在自动开始...")
-        _start_virtual(client, contest_url, page)
-        status, url, page = client.get(contest_url)
-        if _vp_needs_start(page):
-            die(
-                "自动 Start VP 失败。请在浏览器打开比赛页点 Start 后再提交:\n"
-                f"  {contest_url}"
-            )
-
-
-def _start_virtual(client: Client, contest_url: str, page: str) -> str:
-    token = extract_token(page)
-    button = None
-    for pat in (
-        r'name=["\'](submit-[^"\']*virtual[^"\']*)["\']',
-        r'name=["\'](submit-start[^"\']*)["\']',
-        r'name=["\']([^"\']*start_virtual[^"\']*)["\']',
-    ):
-        m = re.search(pat, page, re.I)
-        if m:
-            button = m.group(1)
-            break
-    fields = {"_token": token}
-    if button:
-        vm = re.search(
-            rf'name=["\']{re.escape(button)}["\'][^>]*value=["\']([^"\']*)["\']',
-            page,
-            re.I,
-        )
-        fields[button] = vm.group(1) if vm else "start"
-    else:
-        fields["submit-start_virtual"] = "start_virtual"
-    status, url, resp = client.post_form(contest_url, fields, referer=contest_url)
-    if _vp_needs_start(resp):
-        warn("自动开始 VP 可能失败，请在浏览器打开比赛页点 Start")
-    else:
-        ok("已开始 Virtual Participation")
-    return resp
 
 
 def _write_templates(dest_dir: Path, letters: Iterable[str]) -> None:
@@ -2777,18 +2742,6 @@ def _print_problems(problems: dict) -> None:
         print(f"  {letter:<3} {p['id']:<9} {p['title']}")
 
 
-def cmd_start(args: argparse.Namespace) -> None:
-    cfg = load_global()
-    _, contest = require_contest()
-    client = make_client(cfg, contest, debug=args.debug)
-    url = contest["contest_url"]
-    status, _, page = client.get(url)
-    if not _vp_needs_start(page):
-        ok("VP 已经开始，或本场不需要 Start")
-        return
-    _start_virtual(client, url, page)
-
-
 def cmd_problems(args: argparse.Namespace) -> None:
     _, contest = require_contest()
     print(paint(contest.get("name", "Contest"), "1"), contest.get("contest_url", ""))
@@ -2799,17 +2752,22 @@ def cmd_status(args: argparse.Namespace) -> None:
     cfg = load_global()
     _, contest = require_contest()
     client = make_client(cfg, contest, debug=args.debug)
+    name = contest.get("name") or "Contest"
+    cid = contest.get("contest_id") or "?"
+    info(f"{name}  UID {cid}")
     try:
-        rows = fetch_submission_rows(client, contest)
+        rows = fetch_submission_rows(client, contest, site_wide=False)
     except (TimeoutError, OSError) as exc:
         die(f"提交列表超时: {exc}\n请再试: ./submit status")
         return
     if not rows:
-        warn("没有提交记录（或解析失败）")
+        warn("本场还没有提交记录")
+        info(f"评测板: {contest['contest_url'].rstrip('/')}/submissions")
         return
     print(paint(f"{'ID':<10} {'Problem':<28} Result", "1"))
     for row in rows[: args.limit]:
-        print(f"{row['id']:<10} {row['problem'][:28]:<28} {verdict_color(row['status'])}")
+        label = _contest_problem_label(contest, row) or row.get("problem") or "?"
+        print(f"{row['id']:<10} {label[:28]:<28} {verdict_color(row['status'])}")
 
 
 def resolve_source(name: str) -> Path:
@@ -2851,7 +2809,11 @@ def letter_from_filename(path: Path, problems: dict, explicit: Optional[str]) ->
     return letter
 
 
-def submissions_list_urls(contest: dict, problem_id: Optional[str] = None) -> List[str]:
+def submissions_list_urls(
+    contest: dict,
+    problem_id: Optional[str] = None,
+    site_wide: bool = False,
+) -> List[str]:
     username = contest.get("username") or ""
     site = (contest.get("site") or "").rstrip("/")
     contest_url = contest["contest_url"].rstrip("/")
@@ -2861,10 +2823,9 @@ def submissions_list_urls(contest: dict, problem_id: Optional[str] = None) -> Li
     if problem_id:
         params["problem_id"] = problem_id
     q = ("?" + urlencode(params)) if params else ""
-    urls = [
-        contest_url + "/submissions" + q,
-        site + "/submissions" + q,
-    ]
+    urls = [contest_url + "/submissions" + q]
+    if site_wide and site:
+        urls.append(site + "/submissions" + q)
     if problem_id:
         params2 = dict(params)
         params2.pop("problem_id", None)
@@ -2883,15 +2844,19 @@ def fetch_submission_rows(
     problem_id: Optional[str] = None,
     timeout: int = 10,
     retries: int = 0,
+    site_wide: bool = False,
 ) -> List[dict]:
     last_err: Optional[BaseException] = None
-    for url in submissions_list_urls(contest, problem_id)[:2]:
+    for url in submissions_list_urls(contest, problem_id, site_wide=site_wide):
         try:
             _, _, page = client.get(url, timeout=timeout, retries=retries, fatal=False)
         except (TimeoutError, OSError) as exc:
             last_err = exc
             continue
-        rows = parse_submission_rows(page)
+        rows = [
+            row for row in parse_submission_rows(page)
+            if _submission_row_matches(row, contest, problem_id)
+        ]
         if rows:
             return rows
     if last_err:
@@ -2900,7 +2865,10 @@ def fetch_submission_rows(
 
 
 def latest_ids(client: Client, contest: dict, problem_id: Optional[str] = None) -> List[str]:
-    return [r["id"] for r in fetch_submission_rows(client, contest, problem_id)]
+    return [
+        r["id"]
+        for r in fetch_submission_rows(client, contest, problem_id, site_wide=True)
+    ]
 
 
 def wait_for_new_sid(
@@ -3006,12 +2974,8 @@ def _load_submit_context(
     )
     if _is_cloudflare_block(page):
         die("被 Cloudflare 拦截。请重新: python3 submit login")
-    if not looks_logged_in(page, url, expect=expect) or _vp_needs_start(page):
-        _ensure_logged_in_and_vp(client, contest, expect=expect)
-        if not extract_token(page) or _vp_needs_start(page):
-            problem_url, status, url, page = _fetch_problem_submit_page(
-                client, contest, problem, on_fetch=on_fetch
-            )
+    if not looks_logged_in(page, url, expect=expect) and "/login" in (url or ""):
+        die("未登录或 Cookie 已过期。请先: python3 submit login")
     before: List[str] = []
     last_sid, last_ts = "", None
     list_timeout = False
@@ -3031,7 +2995,7 @@ def _load_submit_context(
 def cmd_submit(args: argparse.Namespace) -> None:
     cfg = load_global()
     if getattr(args, "contest", None):
-        bind_contest(str(args.contest), start=True, debug=bool(args.debug), quiet=True)
+        bind_contest(str(args.contest), debug=bool(args.debug), quiet=True)
     contest_path, contest = require_contest()
     problems = contest.get("problems") or {}
     if not problems:
@@ -3239,7 +3203,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="submit",
-        description="QOJ VP 的 XCPC 风格命令行提交插件: ./submit a.cpp",
+        description="QOJ 命令行提交: ./submit a.cpp",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""例子:
   python3 submit login
@@ -3268,10 +3232,8 @@ def build_parser() -> argparse.ArgumentParser:
     pi = sub.add_parser("init", aliases=["contest"], help="用比赛 UID 绑定比赛")
     pi.add_argument("url", help="比赛 UID 或 URL，例如 1234")
     pi.add_argument("--site", default=None)
-    pi.add_argument("--no-start", action="store_true", help="不要自动开始 VP")
     pi.add_argument("--template", action="store_true", help="生成 a.cpp b.cpp ... 模板")
 
-    sub.add_parser("start", help="开始 Virtual Participation")
     sub.add_parser("problems", aliases=["list"], help="列出题目")
 
     ps = sub.add_parser("status", help="最近提交")
@@ -3288,7 +3250,7 @@ def looks_like_submit_target(arg: str) -> bool:
     if arg.startswith("-"):
         return False
     commands = {
-        "login", "logout", "init", "start", "problems", "list", "status",
+        "login", "logout", "init", "problems", "list", "status",
         "watch", "whoami", "help",
     }
     if arg in commands:
@@ -3335,7 +3297,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         rest = argv[1:]
         template = "--template" in rest
         rest = [a for a in rest if a != "--template"]
-        bind_contest(uid, start=True, template=template, debug=debug)
+        bind_contest(uid, template=template, debug=debug)
         if rest and looks_like_submit_target(rest[0]):
             sp = argparse.ArgumentParser(prog="submit")
             sp.add_argument("file")
@@ -3362,8 +3324,6 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_whoami(args)
     elif args.cmd in ("init", "contest"):
         cmd_init(args)
-    elif args.cmd == "start":
-        cmd_start(args)
     elif args.cmd in ("problems", "list"):
         cmd_problems(args)
     elif args.cmd == "status":

@@ -62,7 +62,7 @@ python3 submit 1234
 python3 submit init 1234
 ```
 
-会写入当前目录的 `.qoj.json`，并尝试 Start VP。之后在该目录交题即可。
+会写入当前目录的 `.qoj.json`。之后在该目录交题即可。
 
 ### 3. 提交
 
@@ -96,7 +96,6 @@ https://qoj.ac/contest/<id>/submissions
 ```bash
 ./submit problems     # 题目列表
 ./submit status       # 最近提交
-./submit start        # 开始 VP
 ./submit whoami       # 当前登录账号
 ```
 

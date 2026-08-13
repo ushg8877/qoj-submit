@@ -81,10 +81,24 @@ def _maybe_reexec_venv() -> None:
 
 _maybe_reexec_venv()
 
+
+def _curl_cffi_install_hint() -> str:
+    return (
+        f"  {sys.executable} -m pip install -U curl_cffi\n"
+        "或到仓库目录重新运行: ./install.sh"
+    )
+
+
 VERSION = "1.0.0"
 APP_NAME = "qoj-xcpc"
 DEFAULT_SITE = "https://qoj.ac"
+CF_SITE = "https://codeforces.com"
 CONTEST_FILE = ".qoj.json"
+SITE_ALIASES = {
+    "qoj": DEFAULT_SITE,
+    "cf": CF_SITE,
+    "codeforces": CF_SITE,
+}
 DEFAULT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -148,6 +162,19 @@ DEFAULT_QOJ_LANGS = [
     ("D", "D"),
     ("Ruby", "Ruby"),
     ("Haskell", "Haskell"),
+]
+
+# Fallback Codeforces programTypeId values; the submit page list wins when present.
+DEFAULT_CF_LANGS = [
+    ("89", "GNU G++20 13.2 (64 bit, winlibs)"),
+    ("91", "GNU G++23 14.2 (64 bit, msys2)"),
+    ("73", "GNU G++20 11.2.0 (64 bit)"),
+    ("54", "GNU G++17 7.3.0"),
+    ("50", "GNU G++14 6.4.0"),
+    ("43", "GNU GCC C11 5.1.0"),
+    ("70", "PyPy 3.10 (64bit)"),
+    ("31", "Python 3"),
+    ("87", "Java 21 64bit"),
 ]
 
 FINAL_VERDICTS = {
@@ -307,7 +334,108 @@ def strip_html(text: str) -> str:
 def norm_lang(text: str) -> str:
     text = htmlmod.unescape(text).lower()
     text = re.sub(r"\([^)]*\)", "", text)
+    text = text.replace("g++", "c++")
     return re.sub(r"[^a-z0-9+]+", "", text)
+
+
+def _cf_cookie_logged_in(cookie_header: str) -> bool:
+    names = cookie_names(cookie_header)
+    if names.get("X-User") or names.get("X-User-Sha1"):
+        return True
+    return bool(names.get("JSESSIONID") and names.get("39ce7"))
+
+
+def is_codeforces(site: str) -> bool:
+    host = (urlparse(site if "://" in (site or "") else f"https://{site}").hostname or site or "")
+    return "codeforces" in host.lower()
+
+
+def account_key(site: str) -> str:
+    raw = (site or "").strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    host = (urlparse(raw).hostname or raw).lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def oj_label(site: str) -> str:
+    return "Codeforces" if is_codeforces(site) else "QOJ"
+
+
+def select_oj(name: str) -> str:
+    cfg = load_global()
+    site = resolve_site(name, cfg)
+    cfg["site"] = site
+    save_global(cfg)
+    ok(f"已选择 {oj_label(site)}  ({site})")
+    info("绑定比赛:  ./submit <比赛id>")
+    if is_codeforces(site):
+        info("Gym:           ./submit gym <比赛id>")
+    return site
+
+
+def cmd_oj(args: argparse.Namespace) -> None:
+    name = getattr(args, "name", None)
+    if not name:
+        cfg = load_global()
+        site = (cfg.get("site") or DEFAULT_SITE).rstrip("/")
+        ok(f"当前 OJ: {oj_label(site)}  ({site})")
+        info("切换:  ./submit qoj   或   ./submit cf")
+        return
+    select_oj(name)
+
+
+def resolve_site(raw: Optional[str], cfg: Optional[dict] = None) -> str:
+    text = (raw or "").strip().rstrip("/")
+    if not text:
+        return str((cfg or {}).get("site") or DEFAULT_SITE).rstrip("/")
+    alias = SITE_ALIASES.get(text.lower())
+    if alias:
+        return alias
+    if text.startswith("http://") or text.startswith("https://"):
+        return text
+    if "." in text:
+        return "https://" + text
+    die(f"未知 OJ: {raw}。可用 qoj / cf，或完整 URL")
+    raise AssertionError
+
+
+def get_account(cfg: dict, site: str) -> dict:
+    key = account_key(site)
+    acc = ((cfg.get("accounts") or {}).get(key) or {})
+    if isinstance(acc, dict) and acc.get("cookie"):
+        return dict(acc)
+    top = account_key(cfg.get("site") or DEFAULT_SITE)
+    if key == top and cfg.get("cookie"):
+        return {
+            "cookie": str(cfg.get("cookie") or ""),
+            "user_agent": str(cfg.get("user_agent") or ""),
+            "username": str(cfg.get("username") or ""),
+        }
+    return dict(acc) if isinstance(acc, dict) else {}
+
+
+def save_account(cfg: dict, site: str, cookie: str, ua: str, username: str) -> None:
+    key = account_key(site)
+    accounts = cfg.setdefault("accounts", {})
+    if not isinstance(accounts, dict):
+        accounts = {}
+        cfg["accounts"] = accounts
+    accounts[key] = {
+        "cookie": cookie,
+        "user_agent": ua,
+        "username": username,
+    }
+    cfg["site"] = site
+    if not is_codeforces(site):
+        cfg["cookie"] = cookie
+        cfg["user_agent"] = ua
+        cfg["username"] = username
+    save_global(cfg)
 
 
 def parse_cookie_input(raw: str) -> str:
@@ -322,14 +450,26 @@ def parse_cookie_input(raw: str) -> str:
             data = json.loads(text)
         except json.JSONDecodeError as exc:
             die(f"Cookie JSON 解析失败: {exc}")
+        if isinstance(data, list):
+            pairs = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if name and "value" in item and item.get("value") is not None:
+                    pairs.append(f"{name}={item['value']}")
+            if not pairs:
+                die("Cookie JSON 数组里没有 name/value")
+            return "; ".join(pairs)
         if isinstance(data, dict) and len(data) == 1:
             only = next(iter(data.values()))
             if isinstance(only, dict) and any(
-                k in only for k in ("UOJSESSID", "cf_clearance", "uoj_username")
+                k in only
+                for k in ("UOJSESSID", "cf_clearance", "uoj_username", "JSESSIONID")
             ):
                 data = only
         if not isinstance(data, dict):
-            die("Cookie JSON 需要是对象，例如 {\"UOJSESSID\": \"...\"}")
+            die("Cookie JSON 需要是对象，例如 {\"JSESSIONID\": \"...\"}")
         skip = {"请求 cookie", "request cookie", "cookie"}
         pairs = []
         for key, value in data.items():
@@ -339,7 +479,7 @@ def parse_cookie_input(raw: str) -> str:
                 continue
             pairs.append(f"{key}={value}")
         if not pairs:
-            die("Cookie JSON 里没有 UOJSESSID / cf_clearance 等字段")
+            die("Cookie JSON 里没有 JSESSIONID / UOJSESSID / cf_clearance 等字段")
         return "; ".join(pairs)
     return text
 
@@ -399,6 +539,140 @@ class Client:
     def _rebuild_opener(self) -> None:
         self._drop_conn()
         self._ssl_ctx = ssl.create_default_context()
+        self._cffi = None
+        self._used_cffi = False
+
+    def _host_needs_impersonate(self, url: str) -> bool:
+        host = (urlparse(url).hostname or urlparse(self.site).hostname or "").lower()
+        return "codeforces" in host
+
+    def _impersonate_candidates(self) -> List[str]:
+        ua = self.user_agent or ""
+        if re.search(r"Edg/", ua):
+            return ["chrome", "chrome131"]
+        if re.search(r"Chrome/", ua) and not re.search(r"Firefox/", ua):
+            return ["chrome", "chrome131"]
+        return ["firefox", "firefox133"]
+
+    def _cffi_session(self):
+        sess = getattr(self, "_cffi", None)
+        if sess is not None:
+            return sess
+        try:
+            from curl_cffi import requests as cffi_requests
+        except ImportError:
+            return None
+        last: Optional[BaseException] = None
+        for name in self._impersonate_candidates():
+            try:
+                self._cffi = cffi_requests.Session(impersonate=name)
+                if self.debug:
+                    print(f"DEBUG impersonate={name}", file=sys.stderr)
+                return self._cffi
+            except Exception as exc:
+                last = exc
+                continue
+        if self.debug and last:
+            print(f"DEBUG curl_cffi impersonate failed: {last}", file=sys.stderr)
+        return None
+
+    def _cffi_http_once(
+        self,
+        url: str,
+        data: Optional[bytes],
+        extra_headers: Optional[dict],
+        method: str,
+        sock_timeout: float,
+        read_timeout: float,
+        follow_redirects: bool = False,
+    ) -> Optional[Tuple[int, str, bytes, str]]:
+        session = self._cffi_session()
+        if session is None:
+            return None
+        for key, value in self.cookies.items():
+            if not key:
+                continue
+            try:
+                session.cookies.set(key, value)
+            except Exception:
+                pass
+        hdrs = {
+            "User-Agent": self.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        if extra_headers:
+            hdrs.update({k: v for k, v in extra_headers.items() if k.lower() not in ("host", "connection")})
+        follow = follow_redirects or (data is None and method.upper() == "GET")
+        try:
+            resp = session.request(
+                method,
+                url,
+                data=data,
+                headers=hdrs,
+                timeout=(sock_timeout, read_timeout),
+                allow_redirects=follow,
+            )
+        except TypeError:
+            try:
+                resp = session.request(
+                    method,
+                    url,
+                    data=data,
+                    headers=hdrs,
+                    timeout=max(sock_timeout, read_timeout),
+                    allow_redirects=follow,
+                )
+            except Exception as exc:
+                raise OSError(str(exc)) from exc
+        except Exception as exc:
+            raise OSError(str(exc)) from exc
+        try:
+            for key, value in resp.cookies.items():
+                if key and value:
+                    self.cookies[key] = value
+        except Exception:
+            pass
+        raw_set: List[str] = []
+        headers = resp.headers
+        if hasattr(headers, "get_list"):
+            try:
+                raw_set = list(headers.get_list("Set-Cookie") or [])
+            except Exception:
+                raw_set = []
+        if not raw_set:
+            single = headers.get("Set-Cookie") if headers is not None else None
+            if single:
+                raw_set = [single]
+        for item in raw_set:
+            jar = SimpleCookie()
+            try:
+                jar.load(item)
+            except Exception:
+                continue
+            for name, morsel in jar.items():
+                if morsel.value:
+                    self.cookies[name] = morsel.value
+        loc = ""
+        if not follow:
+            loc = headers.get("Location") or headers.get("location") or ""
+        final = str(getattr(resp, "url", "") or url)
+        self._last_url = final
+        ctype = headers.get("Content-Type") or headers.get("content-type") or ""
+        raw = resp.content or b""
+        if raw[:2] == b"\x1f\x8b":
+            try:
+                raw = gzip.decompress(raw)
+            except Exception:
+                pass
+        charset = "utf-8"
+        m = re.search(r"charset=([^\s;]+)", ctype, re.I)
+        if m:
+            charset = m.group(1).strip().strip('"')
+        elif getattr(resp, "encoding", None):
+            charset = str(resp.encoding)
+        self._used_cffi = True
+        return int(resp.status_code), loc, raw, charset
 
     def _drop_conn(self) -> None:
         conn = getattr(self, "_conn", None)
@@ -472,7 +746,15 @@ class Client:
         method: str,
         sock_timeout: float,
         read_timeout: float,
+        follow_redirects: bool = False,
     ) -> Tuple[int, str, bytes, str]:
+        if self._host_needs_impersonate(url):
+            got = self._cffi_http_once(
+                url, data, extra_headers, method, sock_timeout, read_timeout,
+                follow_redirects=follow_redirects,
+            )
+            if got is not None:
+                return got
         parsed = urlparse(url)
         path = parsed.path or "/"
         if parsed.query:
@@ -513,6 +795,7 @@ class Client:
                 m = re.search(r"charset=([^\s;]+)", ctype, re.I)
                 if m:
                     charset = m.group(1).strip().strip('"')
+                self._last_url = url
                 return status, loc, raw, charset
             except (BrokenPipeError, ConnectionResetError, RemoteDisconnected) as exc:
                 last_err = exc
@@ -534,6 +817,7 @@ class Client:
         timeout: int = 25,
         retries: int = 1,
         fatal: bool = True,
+        follow_redirects: bool = False,
     ) -> Tuple[int, str, str]:
         if not url.startswith("http"):
             url = urljoin(self.site + "/", url.lstrip("/"))
@@ -541,31 +825,35 @@ class Client:
         last_err: Optional[BaseException] = None
         is_post = data is not None
         method = (method or ("POST" if is_post else "GET")).upper()
-        sock_timeout = 20 if is_post else 15
+        sock_timeout = 12
         current = url
         send_data = data
         send_method = method
         send_post = is_post
+        self._last_url = current
         for attempt in range(attempts):
             if self.debug:
                 print(f"DEBUG {send_method} {current} (try {attempt + 1}/{attempts})", file=sys.stderr)
-            read_timeout = 8 if send_post else max(10, timeout)
+            read_timeout = 15 if send_post else max(12, timeout)
             redirects = 0
             try:
                 while True:
                     status, loc, raw, encoding = self._http_once(
-                        current, send_data, headers, send_method, sock_timeout, read_timeout
+                        current, send_data, headers, send_method, sock_timeout, read_timeout,
+                        follow_redirects=follow_redirects,
                     )
+                    final = getattr(self, "_last_url", current) or current
                     if loc:
                         loc = urljoin(current, loc)
                     if status in (301, 302, 303, 307, 308) and loc:
-                        if send_post:
+                        if send_post and not follow_redirects:
                             try:
                                 text = raw.decode(encoding, errors="replace")
                             except LookupError:
                                 text = raw.decode("utf-8", errors="replace")
                             return status, loc, text
                         if redirects >= 5:
+                            current = final
                             break
                         current = loc
                         send_method = "GET"
@@ -573,12 +861,21 @@ class Client:
                         send_post = False
                         redirects += 1
                         continue
+                    current = final
                     break
                 try:
                     text = raw.decode(encoding, errors="replace")
                 except LookupError:
                     text = raw.decode("utf-8", errors="replace")
-                if _is_cloudflare_block(text):
+                if _is_cloudflare_block(text) and fatal:
+                    if "codeforces" in (urlparse(current).hostname or "").lower() and not getattr(
+                        self, "_used_cffi", False
+                    ):
+                        die(
+                            "命令行访问 Codeforces 被 Cloudflare 拦截。\n"
+                            "请安装能模仿浏览器的库后重试:\n"
+                            + _curl_cffi_install_hint()
+                        )
                     die(
                         "被 Cloudflare 拦截。请重新执行 ./submit login"
                         "（必须用弹出的 Firefox 过验证，不要用自动化窗口）"
@@ -622,7 +919,14 @@ class Client:
     def get(self, url: str, timeout: int = 15, retries: int = 0, fatal: bool = True) -> Tuple[int, str, str]:
         return self._request(url, timeout=timeout, retries=retries, fatal=fatal)
 
-    def post_form(self, url: str, fields: dict, timeout: int = 25, referer: Optional[str] = None) -> Tuple[int, str, str]:
+    def post_form(
+        self,
+        url: str,
+        fields: dict,
+        timeout: int = 25,
+        referer: Optional[str] = None,
+        follow_redirects: bool = False,
+    ) -> Tuple[int, str, str]:
         data = urlencode(fields).encode("utf-8")
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
@@ -630,7 +934,10 @@ class Client:
         }
         if referer:
             headers["Referer"] = referer
-        return self._request(url, data=data, headers=headers, timeout=timeout, retries=2)
+        return self._request(
+            url, data=data, headers=headers, timeout=timeout, retries=2,
+            follow_redirects=follow_redirects,
+        )
 
     def post_multipart(
         self,
@@ -690,6 +997,26 @@ def extract_token(page: str) -> str:
         m = re.search(pat, page, re.I)
         if m and m.group(1).strip():
             return htmlmod.unescape(m.group(1).strip())
+    return extract_csrf(page)
+
+
+def extract_csrf(page: str) -> str:
+    patterns = [
+        r'name=["\']csrf_token["\'][^>]*value=["\']([^"\']+)["\']',
+        r'name=["\']csrfToken["\'][^>]*value=["\']([^"\']+)["\']',
+        r'value=["\']([^"\']+)["\'][^>]*name=["\']csrf_token["\']',
+        r'value=["\']([^"\']+)["\'][^>]*name=["\']csrfToken["\']',
+        r'<meta[^>]+name=["\']X-Csrf-Token["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']X-Csrf-Token["\']',
+        r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']',
+        r'data-csrf=["\']([^"\']+)["\']',
+        r'window\.(?:csrf(?:Token|_token)?|_csrf)\s*=\s*[\'"]([^\'"]+)[\'"]',
+        r'csrf(?:_token|Token)?["\']?\s*[:=]\s*["\']([^"\']{16,128})["\']',
+    ]
+    for pat in patterns:
+        m = re.search(pat, page or "", re.I)
+        if m and m.group(1).strip() and "function" not in m.group(1).lower():
+            return htmlmod.unescape(m.group(1).strip())
     return ""
 
 
@@ -724,6 +1051,9 @@ def extract_username(page: str) -> str:
     QOJ pages always contain /user/profile/Qingyu (site owner). The real account
     sits next to Logout / 登出 in the navigation bar.
     """
+    handle = extract_cf_handle(page)
+    if handle:
+        return handle
     logout_at = [m.start() for m in re.finditer(r'href=["\'][^"\']*/logout["\']', page, re.I)]
     if not logout_at:
         logout_at = [m.start() for m in re.finditer(r">\s*(Logout|登出)\s*<", page, re.I)]
@@ -750,7 +1080,127 @@ def extract_username(page: str) -> str:
     return ""
 
 
+def _cf_login_form(page: str) -> bool:
+    return bool(
+        re.search(r'name=["\']handleOrEmail["\']', page or "", re.I)
+        or re.search(r'id=["\']enterForm["\']', page or "", re.I)
+    )
+
+
+def _cf_enter_href(html: str) -> bool:
+    """True if this snippet links to the login page /enter, not /contest/123/enter."""
+    return bool(
+        re.search(
+            r"""href=["'](?:https?://[^/"']+)?/enter(?:["'?#]|$)""",
+            html or "",
+            re.I,
+        )
+    )
+
+
+def extract_cf_handle(page: str) -> str:
+    """Current user only. Public /profile/tourist links do not count."""
+    if _cf_login_form(page):
+        return ""
+    chooser = _cf_lang_chooser(page)
+    if chooser and _cf_enter_href(chooser):
+        return ""
+    m = re.search(r"""(?:^|[;\s{])handle\s*=\s*["']([^"']*)["']""", page or "")
+    if m:
+        name = htmlmod.unescape(m.group(1)).strip()
+        if name and name.lower() not in ("null", "undefined", "anonymous", "guest"):
+            return name
+    if not chooser:
+        return ""
+    names = re.findall(
+        r"""href=["'](?:https?://[^/"']+)?/profile/([^"'/?#]+)""",
+        chooser,
+        re.I,
+    )
+    names = [htmlmod.unescape(n) for n in names if n and n.lower() not in ("logout",)]
+    return names[-1] if names else ""
+
+
+def extract_cf_handle_from_url(url: str) -> str:
+    m = re.search(r"/profile/([^/?#]+)", url or "", re.I)
+    if not m:
+        return ""
+    name = htmlmod.unescape(m.group(1)).strip()
+    if name.lower() in ("logout", "enter", "register"):
+        return ""
+    return name
+
+
+def _cf_handle_from_firefox_profile(profile: Optional[Path]) -> str:
+    if not profile or not profile.is_dir():
+        return ""
+    pat = re.compile(r"codeforces\.com/profile/([A-Za-z0-9_.-]+)", re.I)
+    found: List[str] = []
+    places = profile / "places.sqlite"
+    if places.is_file():
+        try:
+            con = sqlite3.connect(f"file:{places}?mode=ro", uri=True, timeout=5)
+            try:
+                rows = con.execute(
+                    "SELECT url FROM moz_places WHERE url LIKE '%codeforces.com/profile/%' "
+                    "ORDER BY last_visit_date DESC LIMIT 30"
+                ).fetchall()
+            finally:
+                con.close()
+            for (url,) in rows:
+                m = pat.search(str(url or ""))
+                if m:
+                    found.append(m.group(1))
+        except sqlite3.Error:
+            pass
+    for rel in (
+        "sessionstore.jsonlz4",
+        "sessionstore.js",
+        "sessionstore-backups/recovery.jsonlz4",
+        "sessionstore-backups/previous.jsonlz4",
+        "sessionstore-backups/recovery.baklz4",
+    ):
+        path = profile / rel
+        if not path.is_file():
+            continue
+        try:
+            blob = path.read_bytes()[:3_000_000]
+        except OSError:
+            continue
+        for m in pat.finditer(blob.decode("latin-1", errors="ignore")):
+            found.append(m.group(1))
+    skip = {"logout", "enter", "register", "tourist"}
+    names = [n for n in found if n and n.lower() not in skip]
+    if not names:
+        return ""
+    return max(set(names), key=names.count)
+
+
+def _cf_lang_chooser(page: str) -> str:
+    m = re.search(
+        r'class=["\'][^"\']*lang-chooser[^"\']*["\'][\s\S]{0,1200}',
+        page or "",
+        re.I,
+    )
+    return m.group(0) if m else ""
+
+
 def looks_logged_in(page: str, url: str = "", expect: str = "") -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    cf_page = "codeforces" in host or "codeforces" in (url or "").lower()
+    if not cf_page and _cf_lang_chooser(page) and not re.search(
+        r'id=["\']form-login["\']', page or "", re.I
+    ):
+        cf_page = True
+    if cf_page:
+        if _cf_login_form(page):
+            return False
+        handle = extract_cf_handle(page)
+        if not handle:
+            return False
+        if expect and handle.lower() != expect.lower():
+            return False
+        return True
     if re.search(r'id=["\']form-login["\']', page, re.I) or re.search(
         r'id=["\']input-username["\']', page, re.I
     ):
@@ -823,6 +1273,8 @@ def collect_language_options(page: str) -> Tuple[str, List[Tuple[str, str]]]:
         opts = _parse_option_tags(inner)
         if not opts or not _is_prog_lang_options(opts):
             continue
+        if name.lower() == "programtypeid":
+            return name, opts
         if "answer" in name.lower() or "language" in name.lower():
             preferred.append((name, opts))
         else:
@@ -851,27 +1303,48 @@ def collect_language_options(page: str) -> Tuple[str, List[Tuple[str, str]]]:
 def pick_language(options: List[Tuple[str, str]], suffix: str, explicit: Optional[str] = None) -> str:
     if not options:
         die("题目页没有语言选项，可能未登录或没有提交表单")
+    cleaned = [
+        (v, l) for v, l in options if "diagnostic" not in f"{v} {l}".lower()
+    ]
+    if cleaned:
+        options = cleaned
     if explicit:
         want = norm_lang(explicit)
         for value, label in options:
-            if want in (norm_lang(value), norm_lang(label)) or want == norm_lang(value):
-                return value
-            if want in norm_lang(label) or want in norm_lang(value):
+            blob = norm_lang(f"{value} {label}")
+            if want in (norm_lang(value), norm_lang(label), blob) or want in blob:
                 return value
         names = ", ".join(f"{v} ({l})" if l != v else v for v, l in options)
         die(f"找不到语言 {explicit!r}。可选: {names}")
     prefer = EXT_LANG_PREFER.get(suffix.lower(), [])
-    ranked: List[Tuple[int, str]] = []
+    cpp_file = suffix.lower() in {".cpp", ".cc", ".cxx", ".c++"}
+    ranked: List[Tuple[int, int, str]] = []
     for value, label in options:
-        token = norm_lang(value) or norm_lang(label)
+        blob = norm_lang(f"{label} {value}")
         score = 10_000
         for i, pref in enumerate(prefer):
-            if pref == token or token.startswith(pref) or pref in token:
+            if pref == blob or blob.startswith(pref) or pref in blob:
                 score = i
                 break
-        ranked.append((score, value))
-    ranked.sort(key=lambda x: x[0])
-    return ranked[0][1]
+        if cpp_file and "c++" not in blob:
+            score += 5_000
+        ver = 0
+        vm = re.search(r"(\d+)\.(\d+)", label or "")
+        if vm:
+            ver = -(int(vm.group(1)) * 100 + int(vm.group(2)))
+        ranked.append((score, ver, value))
+    ranked.sort()
+    return ranked[0][2]
+
+
+def language_label(options: List[Tuple[str, str]], value: str) -> str:
+    for item, label in options:
+        if item == value:
+            text = (label or value).strip() or value
+            if value.isdigit() and text != value:
+                return f"{text}  ({value})"
+            return text
+    return value
 
 
 def canonical_problem_url(url: str) -> str:
@@ -891,13 +1364,13 @@ def problem_page_candidates(url: str, site: str, contest_id: str, problem_id: st
             base = f"{site.rstrip('/')}/problem/{problem_id}"
     out: List[str] = []
     for item in (
-        f"{base}/statement/zh_cn",
-        f"{base}/statement/default",
-        f"{base}/statement/en",
         base + "?tab=submit-answer",
         f"{base}/submit",
         base + "?tab=submit",
+        f"{base}/statement/zh_cn",
         base,
+        f"{base}/statement/default",
+        f"{base}/statement/en",
         base + "?locale=en",
         f"{site.rstrip('/')}/problem/{problem_id}?tab=submit-answer",
         f"{site.rstrip('/')}/problem/{problem_id}/submit",
@@ -949,7 +1422,12 @@ def extract_form_action(page: str, current_url: str) -> str:
     return ""
 
 
-def parse_contest_problems(page: str, site: str, contest_id: str) -> Dict[str, dict]:
+def parse_contest_problems(
+    page: str, site: str, contest_id: str, kind: Optional[str] = None
+) -> Dict[str, dict]:
+    if is_codeforces(site):
+        k = kind or ("gym" if "/gym/" in f"{site}/{page[:1500]}" else "contest")
+        return parse_cf_contest_problems(page, site, contest_id, k)
     problems: Dict[str, dict] = {}
     row_re = re.compile(
         r"<tr\b[^>]*>\s*"
@@ -997,16 +1475,142 @@ def parse_contest_problems(page: str, site: str, contest_id: str) -> Dict[str, d
     return problems
 
 
-def parse_contest_name(page: str) -> str:
+def parse_cf_contest_problems(
+    page: str, site: str, contest_id: str, kind: str = "contest"
+) -> Dict[str, dict]:
+    problems: Dict[str, dict] = {}
+    kind = kind if kind in ("contest", "gym") else "contest"
+    cid = re.escape(str(contest_id))
+
+    def add(letter: str, title_html: str = "") -> None:
+        letter = (letter or "").upper()
+        if not re.fullmatch(r"[A-Z]{1,2}\d*", letter):
+            return
+        title = strip_html(title_html)
+        title = re.sub(rf"^{re.escape(letter)}\s*[.\-:]\s*", "", title, flags=re.I).strip()
+        if not title or title.upper() == letter:
+            title = letter
+        prev = problems.get(letter)
+        if prev and len(str(prev.get("title") or "")) >= len(title) and prev.get("title") != letter:
+            return
+        problems[letter] = {
+            "id": letter,
+            "title": title,
+            "url": f"{site.rstrip('/')}/{kind}/{contest_id}/problem/{letter}",
+        }
+
+    link_re = re.compile(
+        rf'href=["\'](?:https?://[^/"\']+)?/(?:{kind}|contest|gym)/{cid}'
+        rf'/problem/([A-Za-z][A-Za-z0-9]*)(?:[/?#][^"\']*)?["\'][^>]*>(.*?)</a>',
+        re.I | re.S,
+    )
+    for letter, title_html in link_re.findall(page or ""):
+        add(letter, title_html)
+    for letter in re.findall(
+        rf'/(?:{kind}|contest|gym)/{cid}/problem/([A-Za-z][A-Za-z0-9]*)',
+        page or "",
+        re.I,
+    ):
+        add(letter)
+    for letter in re.findall(
+        rf'/problemset/problem/{cid}/([A-Za-z][A-Za-z0-9]*)',
+        page or "",
+        re.I,
+    ):
+        add(letter)
+    return problems
+
+
+_JUNK_CONTEST_NAMES = {
+    "dashboard",
+    "codeforces",
+    "problems",
+    "problem",
+    "submit",
+    "submit code",
+    "standings",
+    "gym",
+    "contests",
+    "contest",
+    "problemset",
+    "enter",
+    "login",
+    "status",
+    "submissions",
+    "my submissions",
+    "my",
+    "register",
+    "registration",
+    "finished",
+    "practice",
+    "virtual participation",
+    "clone contest to mashup",
+    "contest materials",
+    "announcement",
+    "announcement (en)",
+}
+
+
+def _is_junk_contest_name(name: str) -> bool:
+    text = re.sub(r"\s+", " ", (name or "").strip())
+    if not text:
+        return True
+    if len(text) > 100:
+        return True
+    low = text.lower()
+    if low in _JUNK_CONTEST_NAMES:
+        return True
+    if low.startswith("submit "):
+        return True
+    if re.match(r"^[a-z]{1,2}\d*\.\s+", low):
+        return True
+    if re.search(
+        r"function\s*\(|\{\s*|\$\(|javascript:|data-page-url|"
+        r"virtual contest is a way|clone this contest|sidebar-caption",
+        low,
+    ):
+        return True
+    return False
+
+
+def contest_display_name(contest: dict) -> str:
+    name = str(contest.get("name") or "").strip()
+    if name and not _is_junk_contest_name(name):
+        return name
+    cid = contest.get("contest_id")
+    if cid:
+        return f"Contest {cid}"
+    return name or "Contest"
+
+
+def parse_contest_name(page: str, site: str = "", contest_id: str = "") -> str:
+    cf = is_codeforces(site) or bool(re.search(r"\bcodeforces\b", page[:2000] or "", re.I))
     m = re.search(r"<title>(.*?)</title>", page, re.I | re.S)
     if m:
         title = strip_html(m.group(1))
+        if cf or re.search(r"\bcodeforces\b", title, re.I):
+            parts = [p.strip() for p in re.split(r"\s*[-–—|]\s*", title) if p.strip()]
+            for part in parts:
+                if not _is_junk_contest_name(part):
+                    return part
         title = re.sub(r"\s*[-|].*$", "", title).strip()
-        if title:
+        if title and not _is_junk_contest_name(title):
             return title
-    m = re.search(r"<h1\b[^>]*>(.*?)</h1>", page, re.I | re.S)
+    if contest_id:
+        cid = re.escape(str(contest_id))
+        for m in re.finditer(
+            rf'href=["\'][^"\']*/(?:contest|gym)/{cid}(?:/?|[?#][^"\']*)?["\'][^>]*>\s*([^<]{{1,80}})\s*</a>',
+            page or "",
+            re.I,
+        ):
+            name = strip_html(m.group(1)).strip()
+            if name and not _is_junk_contest_name(name):
+                return name
+    m = re.search(r"<h1\b[^>]*>([^<]{1,80})</h1>", page, re.I)
     if m:
-        return strip_html(m.group(1))
+        name = strip_html(m.group(1)).strip()
+        if name and not _is_junk_contest_name(name):
+            return name
     return ""
 
 
@@ -1401,11 +2005,13 @@ def hmac_md5_hex(key: str, data: str) -> str:
 
 def make_client(cfg: dict, contest: Optional[dict] = None, debug: bool = False) -> Client:
     site = (contest or {}).get("site") or cfg.get("site") or DEFAULT_SITE
-    cookie = cfg.get("cookie") or ""
-    ua = cfg.get("user_agent") or DEFAULT_UA
+    acc = get_account(cfg, site)
+    cookie = acc.get("cookie") or ""
+    ua = acc.get("user_agent") or cfg.get("user_agent") or DEFAULT_UA
     if not cookie:
+        hint = "python3 submit login cf" if is_codeforces(str(site)) else "python3 submit login"
         die(
-            f"尚未登录。先运行: {Path(sys.argv[0]).name} login\n"
+            f"尚未登录 {site}。先运行: {hint}\n"
             f"配置文件: {global_config_path()}"
         )
     return Client(site, cookie=cookie, user_agent=ua, debug=debug)
@@ -1856,50 +2462,69 @@ def _cdp_harvest(port: int) -> Tuple[str, str, str]:
             pass
 
 
-def _firefox_sqlite_cookies(profile: Path) -> Dict[str, str]:
+def _firefox_sqlite_cookies(profile: Path, host_needles: Optional[List[str]] = None) -> Dict[str, str]:
     src = profile / "cookies.sqlite"
     if not src.is_file():
         return {}
-    fd, tmp = tempfile.mkstemp(suffix=".sqlite")
-    os.close(fd)
-    tmp_path = Path(tmp)
-    extras = []
+    needles = [n.lower() for n in (host_needles or ["qoj.ac"]) if n]
+    rows: List[tuple] = []
     try:
-        shutil.copy2(src, tmp_path)
-        for suffix in ("-wal", "-shm"):
-            side = Path(str(src) + suffix)
-            if side.is_file():
-                dest = Path(str(tmp_path) + suffix)
-                shutil.copy2(side, dest)
-                extras.append(dest)
-        con = sqlite3.connect(str(tmp_path))
+        con = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=8)
         try:
             rows = con.execute("SELECT host, name, value FROM moz_cookies").fetchall()
         finally:
             con.close()
-        out: Dict[str, str] = {}
-        preferred: Dict[str, str] = {}
-        for host, name, value in rows:
-            if not name or value is None:
-                continue
-            host_s = str(host or "")
-            if "qoj.ac" not in host_s:
-                continue
-            host_key = host_s.lstrip(".")
-            if host_key == "qoj.ac":
-                preferred[str(name)] = str(value)
-            elif str(name) not in preferred:
-                out[str(name)] = str(value)
-        out.update(preferred)
-        return out
-    except Exception:
-        return {}
-    finally:
-        for path in [tmp_path, *extras]:
+    except sqlite3.Error:
+        rows = []
+    if not rows:
+        fd, tmp = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        tmp_path = Path(tmp)
+        extras = []
+        try:
+            shutil.copy2(src, tmp_path)
+            for suffix in ("-wal", "-shm"):
+                side = Path(str(src) + suffix)
+                if side.is_file():
+                    dest = Path(str(tmp_path) + suffix)
+                    shutil.copy2(side, dest)
+                    extras.append(dest)
+            con = sqlite3.connect(str(tmp_path), timeout=8)
             try:
-                path.unlink()
-            except OSError:
-                pass
+                rows = con.execute("SELECT host, name, value FROM moz_cookies").fetchall()
+            finally:
+                con.close()
+        except Exception:
+            rows = []
+        finally:
+            for path in [tmp_path, *extras]:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+    out: Dict[str, str] = {}
+    preferred: Dict[str, str] = {}
+
+    def keep(dst: Dict[str, str], name: str, value: str) -> None:
+        old = dst.get(name, "")
+        if old and (not value or len(value) < len(old)):
+            return
+        dst[name] = value
+
+    for host, name, value in rows:
+        if not name or value is None:
+            continue
+        host_s = str(host or "").lower()
+        if not any(n in host_s for n in needles):
+            continue
+        host_key = host_s.lstrip(".")
+        prefer = any(host_key == n or host_key.endswith("." + n) for n in needles)
+        if prefer:
+            keep(preferred, str(name), str(value))
+        elif str(name) not in preferred:
+            keep(out, str(name), str(value))
+    out.update(preferred)
+    return out
 
 
 def _firefox_user_agent(binary: str, profile: Path) -> str:
@@ -1924,8 +2549,9 @@ def _firefox_user_agent(binary: str, profile: Path) -> str:
         m = re.search(r"Firefox\s+(\d+)", out, re.I)
         if m:
             ver = m.group(1)
+            os_token = "X11; Ubuntu; Linux x86_64" if Path("/etc/os-release").is_file() and "ubuntu" in Path("/etc/os-release").read_text(encoding="utf-8", errors="replace").lower() else "X11; Linux x86_64"
             return (
-                f"Mozilla/5.0 (X11; Linux x86_64; rv:{ver}.0) "
+                f"Mozilla/5.0 ({os_token}; rv:{ver}.0) "
                 f"Gecko/20100101 Firefox/{ver}.0"
             )
     except Exception:
@@ -1933,8 +2559,14 @@ def _firefox_user_agent(binary: str, profile: Path) -> str:
     return "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
 
-def _session_ready(cookie_header: str, html: str = "") -> bool:
+def _session_ready(cookie_header: str, html: str = "", site: str = "") -> bool:
+    if html and _is_cloudflare_block(html):
+        html = ""
     names = cookie_names(cookie_header)
+    if is_codeforces(site):
+        if html and looks_logged_in(html, url=site):
+            return True
+        return bool(_cf_cookie_logged_in(cookie_header))
     if names.get("UOJSESSID") and (
         names.get("uoj_username") or names.get("uoj_remember_token")
     ):
@@ -2018,14 +2650,69 @@ def _clear_qoj_session_cookies(profile: Path) -> None:
         _clear_named_cookies_sqlite(db, "cookies", "name", "host_key")
 
 
-def _forget_saved_login(cfg: dict) -> str:
-    old = str(cfg.get("username") or "")
-    cfg["cookie"] = ""
-    cfg["username"] = ""
+def _clear_host_session_cookies(profile: Path, host: str, keep: Tuple[str, ...] = ("cf_clearance",)) -> None:
+    if not profile.is_dir() or not host:
+        return
+    like = f"%{host}%"
+    keep_names = tuple(keep)
+    targets = [
+        (profile / "cookies.sqlite", "moz_cookies", "name", "host"),
+        (profile / "Cookies", "cookies", "name", "host_key"),
+        (profile / "Default" / "Cookies", "cookies", "name", "host_key"),
+        (profile / "Default" / "Network" / "Cookies", "cookies", "name", "host_key"),
+    ]
+    for db, table, name_col, host_col in targets:
+        if not db.is_file():
+            continue
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=rw", uri=True, timeout=5)
+            try:
+                if keep_names:
+                    ph = ",".join("?" * len(keep_names))
+                    con.execute(
+                        f"DELETE FROM {table} WHERE {host_col} LIKE ? AND {name_col} NOT IN ({ph})",
+                        (like, *keep_names),
+                    )
+                else:
+                    con.execute(
+                        f"DELETE FROM {table} WHERE {host_col} LIKE ?",
+                        (like,),
+                    )
+                con.commit()
+                try:
+                    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:
+                    pass
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+
+
+def _forget_saved_login(cfg: dict, site: Optional[str] = None) -> str:
+    site = (site or cfg.get("site") or DEFAULT_SITE).rstrip("/")
+    key = account_key(site)
+    acc = get_account(cfg, site)
+    old = str(acc.get("username") or cfg.get("username") or "")
+    accounts = cfg.get("accounts")
+    if isinstance(accounts, dict):
+        accounts.pop(key, None)
+        cfg["accounts"] = accounts
+    if account_key(cfg.get("site") or "") == key or not is_codeforces(site):
+        if not is_codeforces(site):
+            cfg["cookie"] = ""
+            cfg["username"] = ""
     save_global(cfg)
     _kill_stale_login_browsers()
-    _clear_qoj_session_cookies(_firefox_profile_dir())
-    _clear_qoj_session_cookies(Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile")
+    host = key or "qoj.ac"
+    if is_codeforces(site):
+        _clear_host_session_cookies(_firefox_profile_dir(), host)
+        _clear_host_session_cookies(
+            Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile", host
+        )
+    else:
+        _clear_qoj_session_cookies(_firefox_profile_dir())
+        _clear_qoj_session_cookies(Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile")
     return old
 
 
@@ -2092,6 +2779,119 @@ def _firefox_profile_dir() -> Path:
         dest = Path.home() / ".local" / "share" / "qoj-xcpc" / "firefox-profile"
     dest.mkdir(parents=True, exist_ok=True)
     return dest
+
+
+def _firefox_profile_roots(binary: str = "") -> List[Path]:
+    snap = Path.home() / "snap" / "firefox" / "common" / ".mozilla" / "firefox"
+    native = Path.home() / ".mozilla" / "firefox"
+    blob = (binary or "").lower()
+    try:
+        if binary:
+            blob += " " + str(Path(binary).resolve()).lower()
+    except OSError:
+        pass
+    if "snap" in blob or (snap / "profiles.ini").is_file():
+        return [snap, native]
+    return [native, snap]
+
+
+def _parse_firefox_profiles_ini(root: Path) -> Optional[Path]:
+    ini = root / "profiles.ini"
+    if not ini.is_file():
+        return None
+    try:
+        text = ini.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    sections: List[dict] = []
+    cur: dict = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            if cur:
+                sections.append(cur)
+            cur = {"_name": line[1:-1]}
+            continue
+        if "=" in line and cur:
+            key, value = line.split("=", 1)
+            cur[key.strip()] = value.strip()
+    if cur:
+        sections.append(cur)
+
+    def resolve(path: str, relative: bool) -> Optional[Path]:
+        dest = root / path if relative else Path(path)
+        if dest.is_dir() and "qoj-submit-profile" not in str(dest):
+            return dest
+        return None
+
+    for sec in sections:
+        if sec.get("Default") == "1" and sec.get("Path"):
+            found = resolve(sec["Path"], sec.get("IsRelative", "1") != "0")
+            if found:
+                return found
+    for sec in sections:
+        if str(sec.get("_name") or "").startswith("Install") and sec.get("Default"):
+            found = resolve(sec["Default"], True)
+            if found:
+                return found
+    for sec in sections:
+        if sec.get("Path"):
+            found = resolve(sec["Path"], sec.get("IsRelative", "1") != "0")
+            if found:
+                return found
+    return None
+
+
+def _iter_firefox_profiles(binary: str = "") -> List[Path]:
+    seen = set()
+    out: List[Path] = []
+    for root in _firefox_profile_roots(binary):
+        guessed = _parse_firefox_profiles_ini(root)
+        if guessed and guessed not in seen:
+            seen.add(guessed)
+            out.append(guessed)
+        if not root.is_dir():
+            continue
+        try:
+            kids = list(root.iterdir())
+        except OSError:
+            continue
+        for child in kids:
+            if not child.is_dir() or "qoj-submit-profile" in child.name:
+                continue
+            if not (child / "cookies.sqlite").is_file():
+                continue
+            if child in seen:
+                continue
+            seen.add(child)
+            out.append(child)
+    return out
+
+
+def _firefox_default_profile(binary: str = "", host: str = "") -> Optional[Path]:
+    profiles = _iter_firefox_profiles(binary)
+    if not profiles:
+        return None
+    needles = [host] if host else []
+    if host and "codeforces" in host:
+        needles = ["codeforces.com", "codeforces.org"]
+    best = None
+    best_score = -1
+    for profile in profiles:
+        names = _firefox_sqlite_cookies(profile, needles or None) if needles else {}
+        score = 0
+        if names.get("X-User") or names.get("X-User-Sha1"):
+            score += 3
+        if names.get("JSESSIONID"):
+            score += 2
+        if names.get("cf_clearance"):
+            score += 1
+        if score > best_score:
+            best_score = score
+            best = profile
+    if best_score > 0:
+        return best
+    return profiles[0]
 
 
 def _unlock_browser_profile(profile: Path) -> None:
@@ -2216,7 +3016,7 @@ def _start_ua_sniffer() -> Tuple[object, dict]:
             captured["ua"] = self.headers.get("User-Agent") or captured["ua"]
             body = (
                 "<html><body style='font-family:sans-serif;padding:2em'>"
-                "<p>已记录浏览器 User-Agent。请回到 <b>QOJ 登录</b> 标签页完成验证并登录。</p>"
+                "<p>已记录浏览器 User-Agent。请回到登录标签页完成验证并登录。</p>"
                 "</body></html>"
             ).encode("utf-8")
             self.send_response(200)
@@ -2234,14 +3034,27 @@ def _start_ua_sniffer() -> Tuple[object, dict]:
 
 
 def _start_real_browser(
-    kind: str, binary: str, site: str, profile: Path, port: int, extra_url: str = ""
+    kind: str,
+    binary: str,
+    site: str,
+    profile: Path,
+    port: int,
+    extra_url: str = "",
+    isolated: bool = True,
 ) -> Tuple[subprocess.Popen, Path]:
-    profile.mkdir(parents=True, exist_ok=True)
-    _unlock_browser_profile(profile)
-    url = site.rstrip("/") + "/logout"
+    if isolated:
+        profile.mkdir(parents=True, exist_ok=True)
+        _unlock_browser_profile(profile)
+    if is_codeforces(site):
+        url = site.rstrip("/") + "/enter"
+    else:
+        url = site.rstrip("/") + "/logout"
     env = os.environ.copy()
-    log_path = profile / "launch.log"
-    if kind == "firefox":
+    log_path = (profile / "launch.log") if isolated else Path(tempfile.gettempdir()) / "qoj-cf-firefox.log"
+    if kind == "firefox" and not isolated:
+        env.pop("MOZ_NO_REMOTE", None)
+        cmd = [binary, "--new-window", url]
+    elif kind == "firefox":
         env["MOZ_NO_REMOTE"] = "1"
         env["MOZ_DISABLE_AUTO_SAFE_MODE"] = "1"
         cmd = [binary, "-no-remote", "--profile", str(profile), url]
@@ -2260,6 +3073,8 @@ def _start_real_browser(
         ]
     if extra_url:
         cmd.append(extra_url)
+    if is_codeforces(site):
+        cmd.append(site.rstrip("/") + "/profile")
     logf = open(log_path, "wb")
     proc = subprocess.Popen(
         cmd,
@@ -2282,14 +3097,28 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
 
     info("正在关闭上次登录残留的 Firefox / geckodriver ...")
     _kill_stale_login_browsers()
-    _clear_qoj_session_cookies(_firefox_profile_dir())
-    _clear_qoj_session_cookies(Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile")
+    host = account_key(site) or "qoj.ac"
+    needles = [host]
+    if is_codeforces(site):
+        needles = ["codeforces.com", "codeforces.org"]
+    if not is_codeforces(site):
+        _clear_qoj_session_cookies(_firefox_profile_dir())
+        _clear_qoj_session_cookies(Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile")
 
     httpd, captured = _start_ua_sniffer()
     try:
         for kind, binary in binaries:
             port = _free_port()
-            if kind == "firefox":
+            isolated = True
+            if kind == "firefox" and is_codeforces(site):
+                default_profile = _firefox_default_profile(binary, host)
+                if default_profile:
+                    profile = default_profile
+                    isolated = False
+                else:
+                    profile = _firefox_profile_dir()
+                    warn("没有找到日常 Firefox 配置，改用独立配置（可能被 Cloudflare 拦截）")
+            elif kind == "firefox":
                 profile = _firefox_profile_dir()
             else:
                 profile = Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile"
@@ -2298,17 +3127,30 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
             info(f"正在打开普通 {kind}")
             info(f"  程序: {binary}")
             info(f"  配置: {profile}")
-            info("会先退出窗口里的旧账号。请在登录页登录要换的账号（含 Cloudflare）")
+            if is_codeforces(site):
+                info("会用你平时的 Firefox 打开 Codeforces。请在窗口里完成 Cloudflare，再点右上角 Enter 登录")
+                info("不要关那个窗口，登录成功后脚本会自动继续（不会关掉你的 Firefox）")
+                try:
+                    import curl_cffi  # noqa: F401
+                except ImportError:
+                    warn(
+                        "未安装 curl_cffi，命令行可能仍被 Cloudflare 拦截。请先:\n"
+                        + _curl_cffi_install_hint()
+                    )
+            else:
+                info("会先退出窗口里的旧账号。请在登录页登录要换的账号（含 Cloudflare）")
             try:
                 proc, log_path = _start_real_browser(
-                    kind, binary, site, profile, port, extra_url=sniff_url
+                    kind, binary, site, profile, port, extra_url=sniff_url, isolated=isolated
                 )
             except Exception as exc:
                 warn(f"启动 {binary} 失败: {exc}")
                 continue
+            keep_browser = not isolated
             try:
                 time.sleep(2.0)
-                if proc.poll() is not None:
+                handed_off = keep_browser and proc.poll() is not None
+                if proc.poll() is not None and not keep_browser:
                     tail = ""
                     try:
                         tail = log_path.read_text(encoding="utf-8", errors="replace")[-2000:]
@@ -2316,18 +3158,22 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
                         pass
                     warn(f"{kind} 启动后立刻退出。日志:\n{tail or '(无)'}")
                     continue
+                if handed_off:
+                    info("已在现有 Firefox 中打开标签页")
                 cdp_ok = False
                 if kind != "firefox":
                     cdp_ok = _wait_debug_port(port, proc)
                 deadline = time.time() + 900
                 last_cookie, last_ua, last_html = "", captured.get("ua") or ff_ua, ""
                 seen_logged_out = False
-                names0 = _firefox_sqlite_cookies(profile) if kind == "firefox" else {}
-                if not names0.get("UOJSESSID") and not names0.get("uoj_username"):
+                names0 = _firefox_sqlite_cookies(profile, needles) if kind == "firefox" else {}
+                if is_codeforces(site):
+                    seen_logged_out = True
+                elif not names0.get("UOJSESSID") and not names0.get("uoj_username"):
                     seen_logged_out = True
                 last_hint = 0.0
                 while time.time() < deadline:
-                    if proc.poll() is not None:
+                    if proc.poll() is not None and not keep_browser:
                         tail = ""
                         try:
                             tail = log_path.read_text(encoding="utf-8", errors="replace")[-1500:]
@@ -2342,13 +3188,24 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
                         except Exception:
                             cdp_ok = _wait_debug_port(port, proc, seconds=1)
                     if not cookie and kind == "firefox":
-                        names = _firefox_sqlite_cookies(profile)
+                        names = _firefox_sqlite_cookies(profile, needles)
                         cookie = "; ".join(f"{k}={v}" for k, v in names.items())
                     ua = ua or captured.get("ua") or last_ua or ff_ua
-                    ready = bool(cookie) and _session_ready(cookie, html)
+                    if is_codeforces(site) and _cf_cookie_logged_in(cookie):
+                        ok(f"已检测到登录 ({account_key(site) or site})")
+                        return cookie, ua, html
+                    if cookie and is_codeforces(site) and not html and kind == "firefox":
+                        try:
+                            probe = Client(site, cookie=cookie, user_agent=ua)
+                            _, _, html = probe.get("/enter", timeout=8, retries=0, fatal=False)
+                            if html and _is_cloudflare_block(html):
+                                html = ""
+                        except Exception:
+                            html = ""
+                    ready = bool(cookie) and _session_ready(cookie, html, site=site)
                     if ready and seen_logged_out:
                         last_cookie, last_ua, last_html = cookie, ua, html or last_html
-                        ok("已检测到新的 QOJ 登录")
+                        ok(f"已检测到新的登录 ({account_key(site) or site})")
                         return cookie, ua, html
                     if ready and not seen_logged_out:
                         now = time.time()
@@ -2359,14 +3216,26 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
                         seen_logged_out = True
                         if cookie:
                             last_cookie, last_ua, last_html = cookie, ua, html or last_html
+                        if is_codeforces(site):
+                            now = time.time()
+                            if now - last_hint > 12:
+                                names = cookie_names(cookie)
+                                if not names:
+                                    info(f"还没读到 Codeforces Cookie。当前配置: {profile}")
+                                elif not names.get("X-User") and not names.get("X-User-Sha1"):
+                                    info("已读到 Cookie，但还没有登录态。请在窗口右上角点 Enter 登录")
+                                else:
+                                    info("已读到登录 Cookie，正在确认…")
+                                last_hint = now
                     time.sleep(1.2)
-                if seen_logged_out and _session_ready(last_cookie, last_html):
+                if seen_logged_out and _session_ready(last_cookie, last_html, site=site):
                     return last_cookie, last_ua, last_html
             finally:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
+                if not keep_browser:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
     finally:
         try:
             httpd.shutdown()
@@ -2379,12 +3248,17 @@ def login_via_browser(site: str) -> Tuple[str, str, str]:
     got = _login_real_browser(site)
     if got:
         cookie, ua, html = got
-        if cookie_names(cookie).get("UOJSESSID") or looks_logged_in(html):
+        if is_codeforces(site):
+            if looks_logged_in(html, url=site) or _cf_cookie_logged_in(cookie):
+                info("已用普通浏览器完成登录")
+                return cookie, ua, html
+        elif cookie_names(cookie).get("UOJSESSID") or looks_logged_in(html):
             info("已用普通浏览器完成登录")
             return cookie, ua, html
+    hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
     die(
-        "未能用普通 Firefox 登录。请关掉弹出的 QOJ 窗口后重试:\n"
-        "  python3 submit login\n"
+        f"未能用普通 Firefox 登录。请关掉弹出窗口后重试:\n"
+        f"  {hint}\n"
         "不要用带“自动化控制”提示的窗口。"
     )
     raise AssertionError
@@ -2401,29 +3275,58 @@ def _finalize_login(
     cookie = parse_cookie_input(cookie)
     names = cookie_names(cookie)
     client = Client(site, cookie=cookie, user_agent=ua, debug=debug)
+    if is_codeforces(site):
+        status, url, page = client.get("/enter", fatal=False)
+        if _is_cloudflare_block(page):
+            try:
+                status, url, page = client.get("/", fatal=False)
+            except Exception:
+                pass
+        logged = looks_logged_in(page, url) or _cf_cookie_logged_in(cookie)
+        if not logged:
+            die(
+                "还没有登录 Codeforces。请在弹出窗口右上角点 Enter 登录后，再执行:\n"
+                "  python3 submit login cf"
+            )
+        if _is_cloudflare_block(page) and logged:
+            warn("命令行页面仍像 Cloudflare，但浏览器 Cookie 已是登录态，先保存会话")
+        username = extract_cf_handle(page) or extract_cf_handle_from_url(url) or fallback_user or ""
+        if not username:
+            try:
+                _, purl, ppage = client.get("/profile", fatal=False)
+                username = (
+                    extract_cf_handle(ppage)
+                    or extract_cf_handle_from_url(purl)
+                    or username
+                )
+            except Exception:
+                pass
+        if not username:
+            username = _cf_handle_from_firefox_profile(
+                _firefox_default_profile("", "codeforces.com")
+            )
+        save_account(cfg, site, client.cookie_header() or cookie, ua, username)
+        ok(f"已登录 {username or '(未知用户)'} @ {site}")
+        info(f"配置保存在 {global_config_path()}")
+        return
     expect = names.get("uoj_username") or fallback_user or ""
     status, url, page = client.get("/")
     if not looks_logged_in(page, url, expect=expect):
-        status, url, page = client.get("/login")
+        extra = "/enter" if is_codeforces(site) else "/login"
+        status, url, page = client.get(extra)
         if not looks_logged_in(page, url, expect=expect):
             die(
                 "浏览器里看起来已经登录，但命令行请求仍未带上会话。\n"
                 "请再试一次 ./submit login，或确认弹出的窗口里确实登录成功。"
             )
-    username = extract_username(page) or expect or cfg.get("username") or ""
-    cfg.update({
-        "site": site,
-        "cookie": client.cookie_header() or cookie,
-        "user_agent": ua,
-        "username": username,
-    })
-    save_global(cfg)
+    username = extract_username(page) or expect or get_account(cfg, site).get("username") or ""
+    save_account(cfg, site, client.cookie_header() or cookie, ua, username)
     ok(f"已登录 {username or '(未知用户)'} @ {site}")
     info(f"配置保存在 {global_config_path()}")
 
 
 def _read_multiline_cookie() -> str:
-    print("Cookie（可粘贴一行 header，或整段 JSON；输入空行结束）:")
+    print("Cookie（粘贴一行 header 或 JSON；输入空行结束）:")
     lines: List[str] = []
     while True:
         try:
@@ -2442,44 +3345,86 @@ def _read_multiline_cookie() -> str:
                 break
             except json.JSONDecodeError:
                 continue
+        if blob.startswith("[") and blob.count("[") <= blob.count("]"):
+            try:
+                json.loads(blob)
+                break
+            except json.JSONDecodeError:
+                continue
     return "\n".join(lines).strip()
+
+
+def _prompt_cookie_login(site: str) -> Tuple[str, str]:
+    if is_codeforces(site):
+        print(
+            "Codeforces 请用你平时能打开的浏览器登录，再把 Cookie 贴进来\n"
+            "（插件自带的 Firefox 会被 Cloudflare 卡住）。\n"
+            "\n"
+            "  1. 打开 https://codeforces.com 并登录\n"
+            "  2. F12 → Network → 刷新 → 点开任意 codeforces.com 请求\n"
+            "  3. 复制 Request Headers 里的整段 Cookie\n"
+            "     不要用 document.cookie，会缺 HttpOnly（如 JSESSIONID）\n"
+            "  4. 同一请求里再复制 User-Agent\n"
+        )
+    else:
+        print("手动粘贴 Cookie。有 cf_clearance 时必须同时提供同一浏览器的 User-Agent。")
+    cookie = _read_multiline_cookie()
+    if not cookie:
+        die("没有读到 Cookie")
+    ua_in = input("User-Agent（与 Cookie 同一浏览器；直接回车则用已保存的）: ").strip()
+    return cookie, ua_in
 
 
 def cmd_login(args: argparse.Namespace) -> None:
     cfg = load_global()
-    site = (args.site or cfg.get("site") or DEFAULT_SITE).rstrip("/")
-    ua = args.user_agent or cfg.get("user_agent") or DEFAULT_UA
+    if getattr(args, "oj", None) or args.site:
+        site = resolve_site(args.site or args.oj)
+    else:
+        site = (cfg.get("site") or DEFAULT_SITE).rstrip("/")
+    info(f"登录 {oj_label(site)}  ({site})")
+    ua = args.user_agent or get_account(cfg, site).get("user_agent") or cfg.get("user_agent") or DEFAULT_UA
     cookie = args.cookie
     if args.cookie_file:
         cookie = Path(args.cookie_file).read_text(encoding="utf-8").strip()
 
-    if not cookie and not args.username and not args.manual:
-        prev = cfg.get("username") or ""
+    want_browser = bool(getattr(args, "browser", False))
+    if not cookie and not args.username and (want_browser or not args.manual):
+        prev = get_account(cfg, site).get("username") or ""
         if prev:
-            info(f"本地当前是 {prev}，先退出再登录新账号")
-        _forget_saved_login(cfg)
+            info(f"本地 {account_key(site)} 当前是 {prev}，先退出再登录新账号")
+        _forget_saved_login(cfg, site)
         cookie, ua, html = login_via_browser(site)
-        fallback = extract_username(html) or cookie_names(cookie).get("uoj_username") or ""
+        fallback = (
+            extract_cf_handle(html)
+            or extract_username(html)
+            or cookie_names(cookie).get("uoj_username")
+            or ""
+        )
         _finalize_login(cfg, site, cookie, ua, args.debug, fallback_user=fallback)
         return
 
     if not cookie and not args.username:
-        print("手动粘贴 Cookie。有 cf_clearance 时必须同时提供同一浏览器的 User-Agent。")
-        cookie = _read_multiline_cookie()
-        ua_in = input("User-Agent（有 cf_clearance 时必填）: ").strip()
+        cookie, ua_in = _prompt_cookie_login(site)
         if ua_in:
             ua = ua_in
+        elif is_codeforces(site) and ua == DEFAULT_UA:
+            die("Codeforces 必须粘贴与 Cookie 同一浏览器的 User-Agent")
     if cookie:
         cookie = parse_cookie_input(cookie)
         names = cookie_names(cookie)
         if "cf_clearance" in names and ua == DEFAULT_UA:
             die(
                 "Cookie 里有 cf_clearance，但 User-Agent 还是脚本默认值。\n"
-                "请使用弹出窗口登录:  python submit login\n"
-                "或加上 --user-agent"
+                "请粘贴同一浏览器的 User-Agent，或加上 --user-agent"
             )
-        if "UOJSESSID" not in names and "uoj_remember_token" not in names:
+        if not is_codeforces(site) and "UOJSESSID" not in names and "uoj_remember_token" not in names:
             warn("没有看到 UOJSESSID / uoj_remember_token，登录可能失败")
+        if is_codeforces(site) and "JSESSIONID" not in names:
+            die(
+                "这段 Cookie 里没有 JSESSIONID，还没带上 Codeforces 登录态。\n"
+                "请用 F12 → Network → 点开任意 codeforces.com 请求 → Request Headers 里的 Cookie。\n"
+                "不要从 Application/存储面板或 document.cookie 导出（会缺 HttpOnly）。"
+            )
         _finalize_login(
             cfg,
             site,
@@ -2489,6 +3434,9 @@ def cmd_login(args: argparse.Namespace) -> None:
             fallback_user=names.get("uoj_username") or "",
         )
         return
+
+    if is_codeforces(site):
+        die("Codeforces 请用窗口登录:  python3 submit login cf")
 
     username = args.username or input("用户名: ").strip()
     password = args.password or getpass.getpass("密码: ")
@@ -2531,37 +3479,71 @@ def cmd_login(args: argparse.Namespace) -> None:
     info(f"配置保存在 {global_config_path()}")
 
 
-def cmd_logout(_args: argparse.Namespace) -> None:
+def cmd_logout(args: argparse.Namespace) -> None:
     cfg = load_global()
-    old = cfg.get("username") or cookie_names(cfg.get("cookie") or "").get("uoj_username") or ""
-    _forget_saved_login(cfg)
-    if old:
-        ok(f"已退出 {old}")
+    if getattr(args, "oj", None):
+        site = resolve_site(args.oj)
     else:
-        ok("已清除本地登录")
-    info("换账号: python3 submit login")
+        site = (cfg.get("site") or DEFAULT_SITE).rstrip("/")
+    acc = get_account(cfg, site)
+    old = acc.get("username") or cookie_names(acc.get("cookie") or "").get("uoj_username") or ""
+    _forget_saved_login(cfg, site)
+    if old:
+        ok(f"已退出 {old} @ {account_key(site)}")
+    else:
+        ok(f"已清除 {account_key(site)} 本地登录")
+    info("换账号:  python3 submit login")
 
 
 def cmd_whoami(args: argparse.Namespace) -> None:
     cfg = load_global()
-    client = make_client(cfg, debug=args.debug)
-    status, url, page = client.get("/")
-    expect = cfg.get("username") or cookie_names(cfg.get("cookie") or "").get("uoj_username") or ""
-    if not looks_logged_in(page, url, expect=expect):
-        die("当前 Cookie 未登录")
+    site = (cfg.get("site") or DEFAULT_SITE).rstrip("/")
+    acc = get_account(cfg, site)
+    if not acc.get("cookie"):
+        hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
+        die(f"{account_key(site)} 未登录。请先: {hint}")
+    client = Client(
+        site,
+        cookie=acc.get("cookie") or "",
+        user_agent=acc.get("user_agent") or cfg.get("user_agent") or DEFAULT_UA,
+        debug=args.debug,
+    )
+    probe = "/enter" if is_codeforces(site) else "/"
+    status, url, page = client.get(probe, fatal=False)
+    expect = acc.get("username") or ""
+    logged = looks_logged_in(page, url, expect=expect)
+    if not logged and is_codeforces(site):
+        logged = _cf_cookie_logged_in(acc.get("cookie") or "")
+    if not logged:
+        hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
+        die(f"{account_key(site)} Cookie 已失效，请重新: {hint}")
     username = extract_username(page) or expect or "?"
+    if is_codeforces(site) and (not username or username == "?"):
+        username = (
+            extract_cf_handle_from_url(url)
+            or _cf_handle_from_firefox_profile(_firefox_default_profile("", "codeforces.com"))
+            or expect
+            or "?"
+        )
+        if username and username != "?" and username != expect:
+            save_account(cfg, site, acc.get("cookie") or "", acc.get("user_agent") or "", username)
     ok(f"{username} @ {client.site}")
 
 
-def parse_contest_ref(raw: str, cfg: dict, site_override: Optional[str] = None) -> Tuple[str, str]:
+def parse_contest_ref(
+    raw: str, cfg: dict, site_override: Optional[str] = None
+) -> Tuple[str, str, str]:
     text = (raw or "").strip()
-    m = re.search(r"(https?://[^/]+)/contest/(\d+)", text)
+    m = re.search(r"(https?://[^/]+)/(contest|gym)/(\d+)", text)
     if m:
-        return m.group(1).rstrip("/"), m.group(2)
+        return m.group(1).rstrip("/"), m.group(3), m.group(2)
     if re.fullmatch(r"\d+", text):
-        site = (site_override or cfg.get("site") or DEFAULT_SITE).rstrip("/")
-        return site, text
-    die("请输入比赛 UID，例如 1234")
+        if site_override:
+            site = resolve_site(site_override, cfg)
+        else:
+            site = (cfg.get("site") or DEFAULT_SITE).rstrip("/")
+        return site, text, "contest"
+    die("请输入比赛 UID，例如 1234 或 https://codeforces.com/contest/2044")
     raise AssertionError
 
 
@@ -2569,27 +3551,43 @@ def bind_contest(
     raw: str,
     *,
     site: Optional[str] = None,
+    kind: Optional[str] = None,
     template: bool = False,
     debug: bool = False,
     quiet: bool = False,
 ) -> dict:
     cfg = load_global()
-    site, contest_id = parse_contest_ref(raw, cfg, site)
-    contest_url = f"{site}/contest/{contest_id}"
+    site, contest_id, parsed_kind = parse_contest_ref(raw, cfg, site)
+    kind = kind or parsed_kind or "contest"
+    if kind not in ("contest", "gym"):
+        kind = "contest"
+    if is_codeforces(site):
+        contest_url = f"{site}/{kind}/{contest_id}"
+    else:
+        contest_url = f"{site}/contest/{contest_id}"
+        kind = "contest"
     client = make_client(cfg, {"site": site}, debug=debug)
     status, url, page = client.get(contest_url)
-    if not looks_logged_in(page, url, expect=cfg.get("username") or "") and "/login" in url:
-        die("未登录或 Cookie 失效，请先 python3 submit login")
+    expect = get_account(cfg, site).get("username") or ""
+    if not looks_logged_in(page, url, expect=expect) and (
+        "/login" in url or "/enter" in url
+    ):
+        hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
+        die(f"未登录或 Cookie 失效，请先 {hint}")
 
-    problems = parse_contest_problems(page, site, contest_id)
+    problems = parse_contest_problems(page, site, contest_id, kind)
     if not problems:
-        die("没有解析到题目。请确认已经登录，且比赛 UID 正确")
-    name = parse_contest_name(page) or f"Contest {contest_id}"
-    username = extract_username(page) or cfg.get("username") or ""
+        hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
+        die(f"没有解析到题目。请确认已经登录（{hint}），且比赛 UID 正确")
+    name = parse_contest_name(page, site, contest_id)
+    if not name or _is_junk_contest_name(name):
+        name = f"Contest {contest_id}"
+    username = extract_username(page) or expect
     data = {
         "site": site,
         "contest_id": contest_id,
         "contest_url": contest_url,
+        "kind": kind,
         "name": name,
         "username": username,
         "problems": problems,
@@ -2631,17 +3629,19 @@ def _page_title(page: str) -> str:
 
 def _is_cloudflare_block(page: str) -> bool:
     """True only for a full-page Cloudflare interstitial, not CF scripts on a real QOJ page."""
+    if looks_logged_in(page) or _cf_login_form(page) or re.search(
+        r'id=["\']form-login["\']', page or "", re.I
+    ):
+        return False
     title = _page_title(page).lower()
     if "just a moment" in title or title.strip() == "attention required!":
         return True
     if re.search(r'id=["\'](?:challenge-running|challenge-error-title)["\']', page, re.I):
-        if looks_logged_in(page) or re.search(r'id=["\']form-login["\']', page, re.I):
-            return False
         return True
     head = strip_html(page)[:500].lower()
     if "checking your browser before accessing" in head:
         return True
-    if "verify you are human" in head and "qoj" not in title:
+    if "verify you are human" in head and "qoj" not in title and "codeforces" not in title:
         return True
     return False
 
@@ -2676,14 +3676,14 @@ def _fetch_problem_submit_page(
     best_page = ""
     best_final = base
     best_status = 404
-    while queue and len(seen) < 12:
+    while queue and len(seen) < 5:
         url = queue.pop(0)
         if url in seen:
             continue
         seen.add(url)
         if on_fetch:
             on_fetch(url)
-        status, final, page = client.get(url, timeout=15, retries=0)
+        status, final, page = client.get(url, timeout=10, retries=0)
         last = (status, final, page)
         for extra in iter_submit_hrefs(page, final or url):
             if extra not in seen:
@@ -2737,14 +3737,14 @@ def _write_templates(dest_dir: Path, letters: Iterable[str]) -> None:
 def _print_problems(problems: dict) -> None:
     print()
     print(paint("  #   ID        Title", "1"))
-    for letter in sorted(problems, key=lambda x: (len(x), x)):
+    for letter in sorted(problems, key=_problem_sort_key):
         p = problems[letter]
         print(f"  {letter:<3} {p['id']:<9} {p['title']}")
 
 
 def cmd_problems(args: argparse.Namespace) -> None:
     _, contest = require_contest()
-    print(paint(contest.get("name", "Contest"), "1"), contest.get("contest_url", ""))
+    print(paint(contest_display_name(contest), "1"), contest.get("contest_url", ""))
     _print_problems(contest.get("problems") or {})
 
 
@@ -2752,17 +3752,22 @@ def cmd_status(args: argparse.Namespace) -> None:
     cfg = load_global()
     _, contest = require_contest()
     client = make_client(cfg, contest, debug=args.debug)
-    name = contest.get("name") or "Contest"
+    name = contest_display_name(contest)
     cid = contest.get("contest_id") or "?"
     info(f"{name}  UID {cid}")
     try:
-        rows = fetch_submission_rows(client, contest, site_wide=False)
+        if is_codeforces(contest.get("site") or ""):
+            rows = fetch_cf_submission_rows(client, contest)
+            board = str(contest["contest_url"]).rstrip("/") + "/my"
+        else:
+            rows = fetch_submission_rows(client, contest, site_wide=False)
+            board = str(contest["contest_url"]).rstrip("/") + "/submissions"
     except (TimeoutError, OSError) as exc:
         die(f"提交列表超时: {exc}\n请再试: ./submit status")
         return
     if not rows:
         warn("本场还没有提交记录")
-        info(f"评测板: {contest['contest_url'].rstrip('/')}/submissions")
+        info(f"评测板: {board}")
         return
     print(paint(f"{'ID':<10} {'Problem':<28} Result", "1"))
     for row in rows[: args.limit]:
@@ -2790,21 +3795,57 @@ def resolve_source(name: str) -> Path:
     raise AssertionError
 
 
+def _problem_sort_key(letter: str):
+    text = str(letter or "").upper()
+    m = re.fullmatch(r"([A-Z]+)(\d*)", text)
+    if not m:
+        return (text, 0)
+    return (m.group(1), int(m.group(2) or 0))
+
+
+def resolve_problem_letter(token: str, problems: dict) -> Optional[str]:
+    """c1 → C1 if that problem exists, otherwise C."""
+    keys = {str(k).upper(): k for k in problems}
+    want = (token or "").strip().upper()
+    if not want:
+        return None
+    if want in keys:
+        return keys[want]
+    m = re.fullmatch(r"([A-Z]{1,2})(\d+)", want)
+    if m and m.group(1) in keys:
+        return keys[m.group(1)]
+    return None
+
+
 def letter_from_filename(path: Path, problems: dict, explicit: Optional[str]) -> str:
+    names = ", ".join(sorted(problems, key=_problem_sort_key))
     if explicit:
-        letter = explicit.strip().upper()
-        if letter not in problems:
-            die(f"没有题目 {letter}。已有: {', '.join(sorted(problems, key=lambda x: (len(x), x)))}")
+        letter = resolve_problem_letter(explicit, problems)
+        if not letter:
+            die(f"没有题目 {explicit.strip().upper()}。已有: {names}")
         return letter
     stem = path.stem
+    hit = resolve_problem_letter(stem, problems)
+    if hit:
+        return hit
+    m = re.match(r"^([A-Za-z]{1,2}\d*)(?:$|[^A-Za-z0-9])", stem)
+    if m:
+        hit = resolve_problem_letter(m.group(1), problems)
+        if hit:
+            return hit
+    m = re.match(r"^([A-Za-z])(\d+)", stem)
+    if m:
+        hit = resolve_problem_letter(m.group(1) + m.group(2), problems)
+        if hit:
+            return hit
     m = re.match(r"^([A-Za-z])", stem)
     if not m:
-        die("无法从文件名判断题号，请使用 a.cpp / b.cpp，或加 --problem A")
-    letter = m.group(1).upper()
-    if letter not in problems:
+        die("无法从文件名判断题号，请使用 a.cpp / c1.cpp，或加 --problem A")
+    letter = resolve_problem_letter(m.group(1), problems)
+    if not letter:
         die(
-            f"文件 {path.name} 对应题目 {letter}，但本场没有这题。\n"
-            f"已有: {', '.join(sorted(problems, key=lambda x: (len(x), x)))}"
+            f"文件 {path.name} 对应题目 {m.group(1).upper()}，但本场没有这题。\n"
+            f"已有: {names}"
         )
     return letter
 
@@ -2864,6 +3905,78 @@ def fetch_submission_rows(
     return []
 
 
+def parse_cf_submission_rows(page: str) -> List[dict]:
+    rows: List[dict] = []
+    seen = set()
+    for tm in re.finditer(r"<tr\b([^>]*)>(.*?)</tr>", page or "", re.I | re.S):
+        attrs, inner = tm.group(1), tm.group(2)
+        sid = _html_attr(attrs, "data-submission-id")
+        if not sid:
+            sm = re.search(r"/(?:contest|gym)/\d+/submission/(\d+)", inner)
+            if not sm:
+                sm = re.search(r"/submission/(\d+)", inner)
+            sid = sm.group(1) if sm else ""
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        pm = re.search(r"/problem/([A-Za-z][A-Za-z0-9]*)", inner)
+        letter = pm.group(1).upper() if pm else ""
+        status = ""
+        vm = re.search(
+            r'class=["\'][^"\']*verdict-[^"\']*["\'][^>]*>(.*?)</',
+            inner,
+            re.I | re.S,
+        )
+        if vm:
+            status = strip_html(vm.group(1))
+        if not status:
+            status = _uoj_status_text(inner) or "?"
+        cells = [strip_html(td) for td in re.findall(r"<td\b[^>]*>(.*?)</td>", inner, re.I | re.S)]
+        rows.append({
+            "id": sid,
+            "problem": letter,
+            "problem_id": letter,
+            "contest_id": "",
+            "submitter": "",
+            "status": status,
+            "cells": cells,
+            "submit_ts": _parse_submit_clock(cells),
+            "url_path": f"/submission/{sid}",
+        })
+    return rows
+
+
+def fetch_cf_submission_rows(
+    client: Client,
+    contest: dict,
+    problem_id: Optional[str] = None,
+    timeout: int = 8,
+    retries: int = 0,
+    fallback: bool = True,
+) -> List[dict]:
+    contest_url = str(contest.get("contest_url") or "").rstrip("/")
+    handle = contest.get("username") or ""
+    urls = [contest_url + "/my"]
+    if fallback and handle:
+        urls.append(contest_url + "/status?" + urlencode({"handle": handle}))
+    last_err: Optional[BaseException] = None
+    want = str(problem_id or "").upper()
+    for url in urls:
+        try:
+            _, _, page = client.get(url, timeout=timeout, retries=retries, fatal=False)
+        except (TimeoutError, OSError) as exc:
+            last_err = exc
+            continue
+        rows = parse_cf_submission_rows(page)
+        if want:
+            rows = [r for r in rows if str(r.get("problem_id") or "").upper() == want]
+        if rows:
+            return rows
+    if last_err:
+        raise last_err
+    return []
+
+
 def latest_ids(client: Client, contest: dict, problem_id: Optional[str] = None) -> List[str]:
     return [
         r["id"]
@@ -2876,26 +3989,27 @@ def wait_for_new_sid(
     contest: dict,
     problem_id: str,
     before: List[str],
-    seconds: float = 8,
+    seconds: float = 4,
 ) -> Optional[str]:
-    info("正在确认提交号...")
     known = set(before)
     deadline = time.time() + seconds
-    last_talk = 0.0
+    announced = False
     while time.time() < deadline:
         try:
-            after = latest_ids(client, contest, problem_id)
+            rows = fetch_submission_rows(
+                client, contest, problem_id, timeout=6, retries=0, site_wide=False
+            )
+            after = [r["id"] for r in rows]
         except (TimeoutError, OSError):
-            time.sleep(0.8)
+            time.sleep(0.35)
             continue
         for item in after:
             if item not in known:
                 return item
-        now = time.time()
-        if now - last_talk > 5:
-            info("还没有看到新提交，继续查...")
-            last_talk = now
-        time.sleep(0.6)
+        if not announced:
+            info("正在确认提交号...")
+            announced = True
+        time.sleep(0.35)
     return None
 
 
@@ -2969,6 +4083,33 @@ def _load_submit_context(
     expect: str,
     on_fetch=None,
 ) -> Tuple[str, int, str, str, List[str], bool, str, Optional[float]]:
+    if is_codeforces(contest.get("site") or ""):
+        submit_url = str(contest["contest_url"]).rstrip("/") + "/submit"
+        if on_fetch:
+            on_fetch("submit")
+        last: Tuple[int, str, str] = (0, submit_url, "")
+        for attempt in range(2):
+            if attempt:
+                time.sleep(0.4)
+            try:
+                status, url, page = client.get(
+                    submit_url, timeout=20, retries=0, fatal=False
+                )
+            except (TimeoutError, OSError):
+                continue
+            last = (status, url, page)
+            if _is_cloudflare_block(page):
+                continue
+            if not looks_logged_in(page, url, expect=expect) and "/enter" in (url or ""):
+                die("未登录或 Cookie 已过期。请先: python3 submit login cf")
+            if extract_csrf(page) or extract_token(page):
+                return submit_url, status, url, page, [], False, "", None
+        status, url, page = last
+        if _is_cloudflare_block(page):
+            die("被 Cloudflare 拦截。请重新: python3 submit login cf")
+        if not looks_logged_in(page, url, expect=expect) and "/enter" in (url or ""):
+            die("未登录或 Cookie 已过期。请先: python3 submit login cf")
+        return submit_url, status, url, page, [], False, "", None
     problem_url, status, url, page = _fetch_problem_submit_page(
         client, contest, problem, on_fetch=on_fetch
     )
@@ -2976,20 +4117,136 @@ def _load_submit_context(
         die("被 Cloudflare 拦截。请重新: python3 submit login")
     if not looks_logged_in(page, url, expect=expect) and "/login" in (url or ""):
         die("未登录或 Cookie 已过期。请先: python3 submit login")
-    before: List[str] = []
-    last_sid, last_ts = "", None
-    list_timeout = False
+    return problem_url, status, url, page, [], False, "", None
+
+
+def _submit_codeforces(
+    client: Client,
+    contest_path: Path,
+    contest: dict,
+    letter: str,
+    problem: dict,
+    code: str,
+    suffix: str,
+    explicit_lang: Optional[str],
+    problem_url: str,
+    url: str,
+    page: str,
+    before: List[str],
+    chosen_lang: Optional[str] = None,
+) -> None:
+    csrf = extract_csrf(page) or extract_token(page)
+    if not csrf:
+        die("没有拿到 CSRF token。请先: python3 submit login cf")
+    opts = parse_select_options(page, "programTypeId")
+    parsed_field, parsed_opts = collect_language_options(page)
+    if parsed_opts:
+        opts = parsed_opts
+    if chosen_lang and (not opts or any(v == chosen_lang for v, _ in opts)):
+        lang = chosen_lang
+    elif opts:
+        lang = pick_language(opts, suffix, explicit_lang)
+    else:
+        lang = pick_language(list(DEFAULT_CF_LANGS), suffix, explicit_lang)
+    ftaa = ""
+    bfaa = ""
+    fm = re.search(r"window\._ftaa\s*=\s*['\"]([^'\"]*)['\"]", page or "")
+    bm = re.search(r"window\._bfaa\s*=\s*['\"]([^'\"]*)['\"]", page or "")
+    if fm:
+        ftaa = fm.group(1)
+    if bm:
+        bfaa = bm.group(1)
+    fields = {
+        "csrf_token": csrf,
+        "action": "submitSolutionFormSubmitted",
+        "submittedProblemIndex": letter,
+        "contestId": str(contest.get("contest_id") or ""),
+        "programTypeId": lang,
+        "source": code,
+        "tabSize": "4",
+        "sourceFile": "",
+        "sourceCodeConfirmed": "true",
+        "_tta": "594",
+    }
+    if ftaa:
+        fields["ftaa"] = ftaa
+    if bfaa:
+        fields["bfaa"] = bfaa
+    post_url = problem_url.split("?")[0] + "?csrf_token=" + csrf
+    info("正在提交...")
     try:
-        if on_fetch:
-            on_fetch("submissions")
-        rows = fetch_submission_rows(client, contest, problem["id"])
-        before = [r["id"] for r in rows]
-        if rows:
-            last_sid = rows[0]["id"]
-            last_ts = rows[0].get("submit_ts")
-    except (TimeoutError, OSError):
-        list_timeout = True
-    return problem_url, status, url, page, before, list_timeout, last_sid, last_ts
+        status, resp_url, resp = client.post_form(
+            post_url, fields, referer=url or problem_url, follow_redirects=True
+        )
+    except TimeoutError:
+        warn("提交响应超时，正在查是否已经交上去（不要重复提交）...")
+        status, resp_url, resp = 0, "", ""
+    err = extract_cf_error(resp)
+    if err:
+        die(f"提交被拒绝: {err}")
+    if "/enter" in (resp_url or ""):
+        die("提交时登录已失效，请 python3 submit login cf")
+    ok_submit = False
+    if status in (301, 302, 303) and "/my" in (resp_url or ""):
+        ok_submit = True
+    if status == 200 and "/my" in (resp_url or ""):
+        ok_submit = True
+    if "submitted successfully" in (resp or "").lower():
+        ok_submit = True
+    sid = ""
+    rows = parse_cf_submission_rows(resp)
+    want = str(letter or "").upper()
+    if want:
+        rows = [r for r in rows if str(r.get("problem_id") or "").upper() == want]
+    for row in rows:
+        if row["id"] not in before:
+            sid = row["id"]
+            break
+    if not sid and ok_submit and rows:
+        sid = rows[0]["id"]
+    if not sid:
+        try:
+            extra = fetch_cf_submission_rows(
+                client, contest, letter, timeout=6, retries=0, fallback=False
+            )
+            for row in extra:
+                if row["id"] not in before:
+                    sid = row["id"]
+                    break
+            if not sid and ok_submit and extra:
+                sid = extra[0]["id"]
+        except (TimeoutError, OSError):
+            pass
+    board = str(contest["contest_url"]).rstrip("/") + "/my"
+    if not ok_submit and not sid:
+        die(
+            "没有确认提交成功。\n"
+            f"HTTP {status}  {resp_url}\n"
+            f"请先 python3 submit status 或打开 {board}"
+        )
+    if sid:
+        remember_submit(contest_path, contest, str(problem.get("id") or letter), sid)
+        ok(f"已提交 #{sid}  {letter}")
+    else:
+        ok(f"已提交 {letter}")
+    info(f"评测结果见 {board}")
+
+
+def extract_cf_error(page: str) -> str:
+    texts: List[str] = []
+    for pat in (
+        r'class=["\']error[^"\']*["\'][^>]*>(.*?)</(?:span|div|td)',
+        r'for=["\']error["\'][^>]*>(.*?)</',
+        r'<span[^>]*class=["\'][^"\']*error[^"\']*["\'][^>]*>(.*?)</span>',
+    ):
+        for m in re.finditer(pat, page or "", re.I | re.S):
+            text = strip_html(m.group(1)).strip()
+            if text and text not in texts and len(text) < 300:
+                texts.append(text)
+    blob = " / ".join(texts[:3])
+    if "submitted successfully" in (page or "").lower():
+        return ""
+    return blob
 
 
 def cmd_submit(args: argparse.Namespace) -> None:
@@ -3011,7 +4268,10 @@ def cmd_submit(args: argparse.Namespace) -> None:
     if not code.strip():
         die(f"{src.name} 是空文件")
 
-    lang_field, options = "answer_answer_language", list(DEFAULT_QOJ_LANGS)
+    if is_codeforces(contest.get("site") or ""):
+        lang_field, options = "programTypeId", list(DEFAULT_CF_LANGS)
+    else:
+        lang_field, options = "answer_answer_language", list(DEFAULT_QOJ_LANGS)
     lang = pick_language(options, suffix, args.lang)
 
     try:
@@ -3020,47 +4280,40 @@ def cmd_submit(args: argparse.Namespace) -> None:
         mtime = 0.0
     cached_sid, cached_ts = cached_last_submit(contest, problem["id"])
 
-    print(paint("== submit ==", "1"), flush=True)
-    print(f"  contest  {contest.get('name')}", flush=True)
-    print(f"  problem  {letter}  {problem['title']}  (#{problem['id']})", flush=True)
-    print(f"  file     {src}", flush=True)
-    print(f"  mtime    {file_mtime(src)}", flush=True)
-    print(f"  lang     {lang}", flush=True)
-    warned_stale = False
-    if cached_ts is not None and mtime and mtime <= cached_ts + 1:
-        warn(f"文件上次修改早于上次提交 #{cached_sid or '?'}，可能是旧代码")
-        warned_stale = True
+    def print_card() -> None:
+        print(paint("== submit ==", "1"), flush=True)
+        print(f"  contest  {contest_display_name(contest)}", flush=True)
+        print(f"  problem  {letter}  {problem['title']}  (#{problem['id']})", flush=True)
+        print(f"  file     {src}", flush=True)
+        print(f"  mtime    {file_mtime(src)}", flush=True)
+        print(f"  lang     {language_label(options, lang)}", flush=True)
+
     if args.dry_run:
+        print_card()
+        if cached_ts is not None and mtime and mtime <= cached_ts + 1:
+            warn(f"文件上次修改早于上次提交 #{cached_sid or '?'}，可能是旧代码")
         warn("dry-run，没有真正提交")
         return
 
     client = make_client(cfg, contest, debug=args.debug)
-    expect = contest.get("username") or cfg.get("username") or ""
-    talk = {"on": False}
-
-    def on_fetch(what: str) -> None:
-        if not talk["on"]:
-            return
-        if what == "submissions":
-            info("正在读取提交记录...")
-        else:
-            info(f"正在打开 {what}")
-
+    expect = contest.get("username") or get_account(cfg, contest.get("site") or "").get("username") or ""
+    chosen_lang = lang
+    before = [cached_sid] if cached_sid else []
     box: dict = {"data": None, "exc": None}
 
     def _prefetch() -> None:
         try:
-            box["data"] = _load_submit_context(
-                client, contest, problem, expect, on_fetch=on_fetch
-            )
+            box["data"] = _load_submit_context(client, contest, problem, expect)
         except BaseException as exc:
             box["exc"] = exc
 
     worker = threading.Thread(target=_prefetch, daemon=True)
     worker.start()
+    print_card()
+    if cached_ts is not None and mtime and mtime <= cached_ts + 1:
+        warn(f"文件上次修改早于上次提交 #{cached_sid or '?'}，可能是旧代码")
     if not getattr(args, "yes", False):
         confirm_or_abort()
-    talk["on"] = True
     if worker.is_alive():
         info("正在打开提交页...")
     worker.join()
@@ -3068,12 +4321,63 @@ def cmd_submit(args: argparse.Namespace) -> None:
         exc = box["exc"]
         if isinstance(exc, SystemExit):
             raise exc
-        raise exc
-    problem_url, status, url, page, before, list_timeout, list_sid, list_ts = box["data"]
-    if list_timeout:
-        warn("拉取提交列表超时，仍继续提交")
-    if not warned_stale and list_ts is not None and mtime and mtime <= list_ts + 1:
-        warn(f"文件上次修改早于上次提交 #{list_sid or '?'}，可能是旧代码")
+        if not (
+            is_codeforces(contest.get("site") or "")
+            and isinstance(exc, (TimeoutError, OSError))
+        ):
+            raise exc
+        box["data"] = None
+    if box["data"] is None:
+        info("正在打开提交页...")
+        client._rebuild_opener()
+        box["data"] = _load_submit_context(client, contest, problem, expect)
+    problem_url, status, url, page, _hist, _list_timeout, _list_sid, _list_ts = box["data"]
+    if is_codeforces(contest.get("site") or "") and not (
+        extract_csrf(page) or extract_token(page)
+    ):
+        info("提交页未就绪，正在重试...")
+        client._rebuild_opener()
+        problem_url, status, url, page, _hist, _list_timeout, _list_sid, _list_ts = (
+            _load_submit_context(client, contest, problem, expect)
+        )
+    fresh_name = parse_contest_name(
+        page, contest.get("site") or "", str(contest.get("contest_id") or "")
+    )
+    cur_name = str(contest.get("name") or "").strip()
+    if _is_junk_contest_name(cur_name):
+        contest["name"] = (
+            fresh_name
+            if fresh_name and not _is_junk_contest_name(fresh_name)
+            else f"Contest {contest.get('contest_id') or ''}".strip()
+        )
+        save_json(contest_path, contest)
+    if is_codeforces(contest.get("site") or ""):
+        opts = parse_select_options(page, "programTypeId")
+        _, parsed_opts = collect_language_options(page)
+        if parsed_opts:
+            opts = parsed_opts
+        if opts:
+            options = opts
+            if any(v == chosen_lang for v, _ in opts):
+                lang = chosen_lang
+            else:
+                lang = pick_language(options, suffix, args.lang)
+        _submit_codeforces(
+            client,
+            contest_path,
+            contest,
+            letter,
+            problem,
+            code,
+            suffix,
+            args.lang,
+            problem_url,
+            url,
+            page,
+            before,
+            chosen_lang=lang,
+        )
+        return
     token = extract_token(page)
     if not token:
         die("没有拿到 CSRF token，页面可能不是提交页")
@@ -3082,7 +4386,10 @@ def cmd_submit(args: argparse.Namespace) -> None:
     parsed_field, parsed_opts = collect_language_options(page)
     if parsed_opts:
         lang_field, options = parsed_field, parsed_opts
-        lang = pick_language(options, suffix, args.lang)
+        if any(v == chosen_lang for v, _ in parsed_opts):
+            lang = chosen_lang
+        else:
+            lang = pick_language(options, suffix, args.lang)
     btn_name, btn_val = extract_submit_button(page)
 
     post_candidates: List[str] = []
@@ -3114,7 +4421,6 @@ def cmd_submit(args: argparse.Namespace) -> None:
     timed_out = False
     for post_url in post_candidates:
         used_post = post_url
-        info(f"POST {post_url}")
         try:
             status, resp_url, resp = client.post_multipart(
                 post_url, fields, files=files, referer=url or post_url, fatal=False
@@ -3137,7 +4443,6 @@ def cmd_submit(args: argparse.Namespace) -> None:
         )
     url = resp_url
     if not timed_out:
-        info(f"服务器已响应 HTTP {status}")
         alert = extract_alerts(resp)
         if alert:
             die(f"提交被拒绝: {alert}")
@@ -3165,7 +4470,7 @@ def cmd_submit(args: argparse.Namespace) -> None:
             sid = from_resp[0]
     if not sid:
         sid = wait_for_new_sid(
-            client, contest, problem["id"], before, seconds=20 if timed_out else 8
+            client, contest, problem["id"], before, seconds=8 if timed_out else 3
         )
 
     if sid and sid not in before:
@@ -3191,7 +4496,8 @@ def cmd_submit(args: argparse.Namespace) -> None:
 
 def watch_submission(_client, contest: dict, sid: str, timeout: int = 300) -> None:
     sid = str(sid).lstrip("#")
-    url = f"{contest['contest_url'].rstrip('/')}/submissions"
+    base = str(contest["contest_url"]).rstrip("/")
+    url = base + ("/my" if is_codeforces(contest.get("site") or "") else "/submissions")
     info(f"评测结果见 {url}")
 
 
@@ -3203,13 +4509,16 @@ def cmd_watch(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="submit",
-        description="QOJ 命令行提交: ./submit a.cpp",
+        description="QOJ / Codeforces 命令行提交: ./submit a.cpp",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""例子:
   python3 submit login
+  python3 submit login cf
+  python3 submit qoj
+  python3 submit cf
   python3 submit 1234
+  python3 submit 2044
   python3 submit a.cpp
-  python3 submit b.py --lang PyPy3
   python3 submit status
 """,
     )
@@ -3218,6 +4527,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd")
 
     pl = sub.add_parser("login", help="弹出登录窗口（推荐）")
+    pl.add_argument("oj", nargs="?", default=None, help="qoj 或 cf，默认当前选择的 OJ")
     pl.add_argument("--site", default=None, help="OJ 地址，默认 https://qoj.ac")
     pl.add_argument("--cookie", default=None, help="Cookie 字符串")
     pl.add_argument("--cookie-file", default=None, help="包含 Cookie 的文件")
@@ -3225,13 +4535,18 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("-u", "--username", default=None)
     pl.add_argument("-p", "--password", default=None)
     pl.add_argument("--manual", action="store_true", help="改用手动粘贴 Cookie")
+    pl.add_argument("--browser", action="store_true", help="强制弹出浏览器窗口登录")
 
-    sub.add_parser("logout", help="退出本地登录，以便换账号")
+    po = sub.add_parser("logout", help="退出本地登录，以便换账号")
+    po.add_argument("oj", nargs="?", default=None, help="qoj 或 cf")
     sub.add_parser("whoami", help="检查当前登录")
 
+    pj = sub.add_parser("oj", help="选择或查看当前 OJ（qoj / cf）")
+    pj.add_argument("name", nargs="?", default=None, help="qoj 或 cf")
+
     pi = sub.add_parser("init", aliases=["contest"], help="用比赛 UID 绑定比赛")
-    pi.add_argument("url", help="比赛 UID 或 URL，例如 1234")
-    pi.add_argument("--site", default=None)
+    pi.add_argument("url", help="比赛 UID 或 URL，例如 1234 或 https://codeforces.com/contest/2044")
+    pi.add_argument("--site", default=None, help="qoj / cf / 完整站点")
     pi.add_argument("--template", action="store_true", help="生成 a.cpp b.cpp ... 模板")
 
     sub.add_parser("problems", aliases=["list"], help="列出题目")
@@ -3251,7 +4566,7 @@ def looks_like_submit_target(arg: str) -> bool:
         return False
     commands = {
         "login", "logout", "init", "problems", "list", "status",
-        "watch", "whoami", "help",
+        "watch", "whoami", "help", "cf", "codeforces", "gym", "qoj", "oj",
     }
     if arg in commands:
         return False
@@ -3292,6 +4607,37 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_submit(args)
         return
 
+    if argv[0] in ("cf", "codeforces", "gym", "qoj"):
+        alias = "gym" if argv[0] == "gym" else ("cf" if argv[0] in ("cf", "codeforces") else "qoj")
+        kind = "gym" if argv[0] == "gym" else "contest"
+        rest = argv[1:]
+        if not rest:
+            if argv[0] == "gym":
+                die("用法: ./submit gym <比赛id>")
+            select_oj(alias)
+            return
+        if not re.fullmatch(r"\d+", rest[0]):
+            die("用法: ./submit cf <比赛id>   或   ./submit gym <比赛id>")
+        uid = rest[0]
+        rest = rest[1:]
+        template = "--template" in rest
+        rest = [a for a in rest if a != "--template"]
+        bind_contest(uid, site=resolve_site(alias), kind=kind, template=template, debug=debug)
+        if rest and looks_like_submit_target(rest[0]):
+            sp = argparse.ArgumentParser(prog="submit")
+            sp.add_argument("file")
+            sp.add_argument("-p", "--problem", default=None)
+            sp.add_argument("-l", "--lang", default=None)
+            sp.add_argument("-y", "--yes", action="store_true")
+            sp.add_argument("-n", "--no-wait", action="store_true")
+            sp.add_argument("--wait", type=int, default=300)
+            sp.add_argument("--dry-run", action="store_true")
+            args = sp.parse_args(rest)
+            args.debug = debug
+            args.contest = None
+            cmd_submit(args)
+        return
+
     if re.fullmatch(r"\d+", argv[0]):
         uid = argv[0]
         rest = argv[1:]
@@ -3322,6 +4668,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         cmd_logout(args)
     elif args.cmd == "whoami":
         cmd_whoami(args)
+    elif args.cmd == "oj":
+        cmd_oj(args)
     elif args.cmd in ("init", "contest"):
         cmd_init(args)
     elif args.cmd in ("problems", "list"):

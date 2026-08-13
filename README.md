@@ -1,6 +1,6 @@
 # qoj-submit
 
-面向 [QOJ](https://qoj.ac) Virtual Participation 的命令行提交工具。用法接近现场 XCPC：绑定比赛后，在当前目录执行：
+面向 [QOJ](https://qoj.ac) 和 [Codeforces](https://codeforces.com) 的命令行提交工具。用法接近现场 XCPC：绑定比赛后，在当前目录执行：
 
 ```bash
 ./submit a.cpp
@@ -48,19 +48,30 @@ python3 submit whoami
 
 换账号时再跑一次 `python3 submit login`：会先退出本地登录和浏览器里的旧会话，再弹出登录窗口。也可以先 `python3 submit logout`。
 
-### 2. 绑定比赛
-
-用比赛 UID，不必贴完整 URL：
+Codeforces 同样用窗口登录（QOJ 和 CF 的 Cookie 分开存）。会打开**你平时的 Firefox**（不是插件独立配置），在窗口里过 Cloudflare，再点右上角 Enter：
 
 ```bash
-python3 submit 1234
+python3 submit login cf
+python3 submit whoami
 ```
 
-或：
+换 CF 账号先在浏览器里退出，再 `python3 submit login cf`。也可以 `python3 submit logout cf` 只清本地保存的登录。
+
+### 2. 选择 OJ，绑定比赛
+
+先选站点（保存在 `~/.config/qoj-xcpc/config.json`），再用比赛 UID 绑定：
 
 ```bash
-python3 submit init 1234
+./submit qoj          # 选择 QOJ
+./submit 1234         # 绑定 QOJ 比赛
+
+./submit cf           # 选择 Codeforces
+./submit 2044         # 绑定 CF 比赛
 ```
+
+查看当前 OJ：`./submit oj`
+
+也可以一次写完：`./submit cf 2044`、`./submit init 1234`。Gym：`./submit gym 105505`。完整 URL 也可以：`./submit init https://codeforces.com/contest/2044`。
 
 会写入当前目录的 `.qoj.json`。之后在该目录交题即可。
 
@@ -73,15 +84,16 @@ python3 submit init 1234
 ./submit a.cpp -y
 ```
 
-题号取文件名第一个字母：`a.cpp` → A，`c.py` → C。
+题号取文件名前缀：`a.cpp` → A，`c.py` → C。Codeforces 的 easy/hard 分题：`c1.cpp` 交 **C1**（没有 C1 时交 C），`c2.cpp` 同理。
 
 确认前提示：
 
-- 比赛、题目、文件
+- 比赛名、题目、文件
+- 即将提交的语言（Codeforces 显示编译器名，例如 GNU G++20，而不是语言编号）
 - 文件上次修改距现在多久
 - 若文件修改时间早于上次提交，会警告可能交的是旧代码
 
-`.cpp` / `.cc` 默认 **C++20**，`.py` 默认 **PyPy3**。
+`.cpp` / `.cc` 默认 **C++20**（Codeforces 对应 GNU G++20，不会误选 GNU GCC C），`.py` 默认 **PyPy3**。换语言用 `--lang`，例如 `./submit a.cpp --lang C++23`。
 
 提交成功后给出比赛提交列表，例如：
 
@@ -94,6 +106,9 @@ https://qoj.ac/contest/<id>/submissions
 ### 其它命令
 
 ```bash
+./submit oj           # 当前 OJ
+./submit qoj          # 选择 QOJ
+./submit cf           # 选择 Codeforces
 ./submit problems     # 题目列表
 ./submit status       # 最近提交
 ./submit whoami       # 当前登录账号
@@ -111,7 +126,7 @@ your-vp/
 
 ## 注意
 
-- 被 Cloudflare 拦截时，重新 `python3 submit login`。Cookie 必须和当时的 User-Agent 来自同一次浏览器会话。
+- 被 Cloudflare 拦截时，重新 `python3 submit login`。Codeforces 请用 `./install.sh` 装好 `curl_cffi`，并在弹出的日常 Firefox 里过验证。
 - 交互题（Anna / Bruno）请用网页提交。
 - `training.qoj.ac` 同样支持，init 时用完整比赛 URL。
 - 登录配置在 `~/.config/qoj-xcpc/config.json`，比赛配置在 `.qoj.json`，都不要提交到 git。

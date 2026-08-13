@@ -19,13 +19,3 @@ submission/
 *.c
 *.py
 !install.sh
-
-# latex build
-*.pdf
-*.log
-*.aux
-*.out
-*.toc
-*.fls
-*.fdb_latexmk
-*.synctex.gz

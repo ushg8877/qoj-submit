@@ -2184,7 +2184,7 @@ def _login_selenium(site: str) -> Optional[Tuple[str, str, str]]:
             driver.set_window_size(1100, 820)
         except Exception:
             pass
-        driver.get(site.rstrip("/") + "/login")
+        driver.get(site.rstrip("/") + "/")
         html, url = _wait_html_logged_in(
             lambda: (driver.page_source, driver.current_url)
         )
@@ -2216,7 +2216,7 @@ def _login_playwright(site: str) -> Optional[Tuple[str, str, str]]:
                 viewport={"width": 1100, "height": 800},
             )
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto(site.rstrip("/") + "/login", wait_until="domcontentloaded")
+            page.goto(site.rstrip("/") + "/", wait_until="domcontentloaded")
             html, url = _wait_html_logged_in(
                 lambda: (page.content(), page.url)
             )
@@ -2278,7 +2278,7 @@ def _login_webview(site: str) -> Optional[Tuple[str, str, str]]:
     info("登录成功后窗口会自动关闭")
     webview.create_window(
         "QOJ 登录",
-        site.rstrip("/") + "/login",
+        site.rstrip("/") + "/",
         width=1100,
         height=820,
     )
@@ -2886,6 +2886,8 @@ def _firefox_default_profile(binary: str = "", host: str = "") -> Optional[Path]
             score += 2
         if names.get("cf_clearance"):
             score += 1
+        if names.get("UOJSESSID") or names.get("uoj_username") or names.get("uoj_remember_token"):
+            score += 3
         if score > best_score:
             best_score = score
             best = profile
@@ -3048,7 +3050,7 @@ def _start_real_browser(
     if is_codeforces(site):
         url = site.rstrip("/") + "/enter"
     else:
-        url = site.rstrip("/") + "/logout"
+        url = site.rstrip("/") + "/"
     env = os.environ.copy()
     log_path = (profile / "launch.log") if isolated else Path(tempfile.gettempdir()) / "qoj-cf-firefox.log"
     if kind == "firefox" and not isolated:
@@ -3095,22 +3097,21 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
         warn("没有找到 firefox / chromium / chrome，请先: sudo apt install firefox")
         return None
 
-    info("正在关闭上次登录残留的 Firefox / geckodriver ...")
+    info("正在关闭上次登录残留的独立配置浏览器（不会关掉你日常用的 Firefox）...")
     _kill_stale_login_browsers()
     host = account_key(site) or "qoj.ac"
     needles = [host]
     if is_codeforces(site):
         needles = ["codeforces.com", "codeforces.org"]
-    if not is_codeforces(site):
-        _clear_qoj_session_cookies(_firefox_profile_dir())
-        _clear_qoj_session_cookies(Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile")
+    elif "qoj" in host:
+        needles = [host, "qoj.ac"]
 
     httpd, captured = _start_ua_sniffer()
     try:
         for kind, binary in binaries:
             port = _free_port()
             isolated = True
-            if kind == "firefox" and is_codeforces(site):
+            if kind == "firefox":
                 default_profile = _firefox_default_profile(binary, host)
                 if default_profile:
                     profile = default_profile
@@ -3118,8 +3119,6 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
                 else:
                     profile = _firefox_profile_dir()
                     warn("没有找到日常 Firefox 配置，改用独立配置（可能被 Cloudflare 拦截）")
-            elif kind == "firefox":
-                profile = _firefox_profile_dir()
             else:
                 profile = Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile"
             sniff_url = f"http://127.0.0.1:{httpd.server_address[1]}/"
@@ -3138,7 +3137,8 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
                         + _curl_cffi_install_hint()
                     )
             else:
-                info("会先退出窗口里的旧账号。请在登录页登录要换的账号（含 Cloudflare）")
+                info("会用你平时的 Firefox 打开站点首页。已登录则直接读取，否则请在窗口里登录")
+                info("不要关那个窗口，登录成功后脚本会自动继续（不会关掉你的 Firefox）")
             try:
                 proc, log_path = _start_real_browser(
                     kind, binary, site, profile, port, extra_url=sniff_url, isolated=isolated
@@ -3165,12 +3165,6 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
                     cdp_ok = _wait_debug_port(port, proc)
                 deadline = time.time() + 900
                 last_cookie, last_ua, last_html = "", captured.get("ua") or ff_ua, ""
-                seen_logged_out = False
-                names0 = _firefox_sqlite_cookies(profile, needles) if kind == "firefox" else {}
-                if is_codeforces(site):
-                    seen_logged_out = True
-                elif not names0.get("UOJSESSID") and not names0.get("uoj_username"):
-                    seen_logged_out = True
                 last_hint = 0.0
                 while time.time() < deadline:
                     if proc.poll() is not None and not keep_browser:
@@ -3191,44 +3185,42 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
                         names = _firefox_sqlite_cookies(profile, needles)
                         cookie = "; ".join(f"{k}={v}" for k, v in names.items())
                     ua = ua or captured.get("ua") or last_ua or ff_ua
-                    if is_codeforces(site) and _cf_cookie_logged_in(cookie):
-                        ok(f"已检测到登录 ({account_key(site) or site})")
-                        return cookie, ua, html
-                    if cookie and is_codeforces(site) and not html and kind == "firefox":
+                    if cookie and not html and kind == "firefox":
                         try:
                             probe = Client(site, cookie=cookie, user_agent=ua)
-                            _, _, html = probe.get("/enter", timeout=8, retries=0, fatal=False)
+                            probe_path = "/enter" if is_codeforces(site) else "/"
+                            _, _, html = probe.get(probe_path, timeout=8, retries=0, fatal=False)
                             if html and _is_cloudflare_block(html):
                                 html = ""
                         except Exception:
                             html = ""
-                    ready = bool(cookie) and _session_ready(cookie, html, site=site)
-                    if ready and seen_logged_out:
-                        last_cookie, last_ua, last_html = cookie, ua, html or last_html
-                        ok(f"已检测到新的登录 ({account_key(site) or site})")
+                    if is_codeforces(site) and _cf_cookie_logged_in(cookie):
+                        ok(f"已检测到登录 ({account_key(site) or site})")
                         return cookie, ua, html
-                    if ready and not seen_logged_out:
-                        now = time.time()
-                        if now - last_hint > 8:
-                            info("窗口里还是旧账号。请点 Logout，再登录新账号")
-                            last_hint = now
-                    else:
-                        seen_logged_out = True
-                        if cookie:
-                            last_cookie, last_ua, last_html = cookie, ua, html or last_html
+                    ready = bool(cookie) and _session_ready(cookie, html, site=site)
+                    if ready:
+                        last_cookie, last_ua, last_html = cookie, ua, html or last_html
+                        ok(f"已检测到登录 ({account_key(site) or site})")
+                        return cookie, ua, html
+                    if cookie:
+                        last_cookie, last_ua, last_html = cookie, ua, html or last_html
+                    now = time.time()
+                    if now - last_hint > 12:
+                        names = cookie_names(cookie)
                         if is_codeforces(site):
-                            now = time.time()
-                            if now - last_hint > 12:
-                                names = cookie_names(cookie)
-                                if not names:
-                                    info(f"还没读到 Codeforces Cookie。当前配置: {profile}")
-                                elif not names.get("X-User") and not names.get("X-User-Sha1"):
-                                    info("已读到 Cookie，但还没有登录态。请在窗口右上角点 Enter 登录")
-                                else:
-                                    info("已读到登录 Cookie，正在确认…")
-                                last_hint = now
+                            if not names:
+                                info(f"还没读到 Codeforces Cookie。当前配置: {profile}")
+                            elif not names.get("X-User") and not names.get("X-User-Sha1"):
+                                info("已读到 Cookie，但还没有登录态。请在窗口右上角点 Enter 登录")
+                            else:
+                                info("已读到登录 Cookie，正在确认…")
+                        elif not names.get("UOJSESSID"):
+                            info("还没读到登录态。请在窗口里登录（含 Cloudflare）")
+                        else:
+                            info("已读到 Cookie，正在确认…")
+                        last_hint = now
                     time.sleep(1.2)
-                if seen_logged_out and _session_ready(last_cookie, last_html, site=site):
+                if _session_ready(last_cookie, last_html, site=site):
                     return last_cookie, last_ua, last_html
             finally:
                 if not keep_browser:
@@ -3391,8 +3383,7 @@ def cmd_login(args: argparse.Namespace) -> None:
     if not cookie and not args.username and (want_browser or not args.manual):
         prev = get_account(cfg, site).get("username") or ""
         if prev:
-            info(f"本地 {account_key(site)} 当前是 {prev}，先退出再登录新账号")
-        _forget_saved_login(cfg, site)
+            info(f"本地 {account_key(site)} 记录是 {prev}，将读取浏览器当前登录")
         cookie, ua, html = login_via_browser(site)
         fallback = (
             extract_cf_handle(html)

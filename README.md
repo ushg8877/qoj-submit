@@ -41,11 +41,11 @@ python3 submit login
 python3 submit whoami
 ```
 
-会弹出浏览器窗口，在里面正常登录（含 Cloudflare）。Codeforces 会打开**你平时的 Firefox**，过验证后点右上角 Enter。
+会弹出**你平时的 Firefox**，直接打开对应 OJ 首页。窗口里已经登录则立刻读取当前账号；否则请在窗口里登录（含 Cloudflare）。Codeforces 过验证后点右上角 Enter。
 
 Cookie 和 User-Agent 保存在 `~/.config/qoj-xcpc/config.json`，各 OJ 分开存，不要提交到 git。Cookie 过期后重新 `login`。
 
-换账号：先在浏览器里退出，再 `python3 submit login`。也可以 `python3 submit logout`，或 `python3 submit logout cf` 只清某一个 OJ。
+换账号：在浏览器里退出后，再 `python3 submit login`。`python3 submit logout` 只清本地保存的登录。
 
 指定站点登录：`python3 submit login cf`。
 

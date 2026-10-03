@@ -90,7 +90,7 @@ def _curl_cffi_install_hint() -> str:
     )
 
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 APP_NAME = "qoj-xcpc"
 DEFAULT_SITE = "https://qoj.ac"
 CF_SITE = "https://codeforces.com"
@@ -420,23 +420,55 @@ def get_account(cfg: dict, site: str) -> dict:
     return dict(acc) if isinstance(acc, dict) else {}
 
 
+def saved_accounts(cfg: dict, site: str) -> dict:
+    """Include the active legacy account without changing the input config."""
+    saved = dict((cfg.get("saved_accounts") or {}).get(account_key(site)) or {})
+    active = get_account(cfg, site)
+    if active.get("cookie"):
+        saved[active.get("username") or "(未知账号)"] = active
+    return saved
+
+
 def save_account(cfg: dict, site: str, cookie: str, ua: str, username: str) -> None:
     key = account_key(site)
-    accounts = cfg.setdefault("accounts", {})
-    if not isinstance(accounts, dict):
-        accounts = {}
-        cfg["accounts"] = accounts
-    accounts[key] = {
-        "cookie": cookie,
-        "user_agent": ua,
-        "username": username,
-    }
-    cfg["site"] = site
-    if not is_codeforces(site):
-        cfg["cookie"] = cookie
-        cfg["user_agent"] = ua
-        cfg["username"] = username
+    previous_site = cfg.get("site") or DEFAULT_SITE
+    previous = saved_accounts(cfg, previous_site)
+    if previous:
+        cfg.setdefault("saved_accounts", {})[account_key(previous_site)] = previous
+        previous_active = get_account(cfg, previous_site)
+        if previous_active.get("cookie"):
+            cfg.setdefault("accounts", {})[account_key(previous_site)] = previous_active
+    saved = saved_accounts(cfg, site)
+    account = {"cookie": cookie, "user_agent": ua, "username": username}
+    saved[username or "(未知账号)"] = account
+    cfg.setdefault("saved_accounts", {})[key] = saved
+    cfg.setdefault("accounts", {})[key] = account
+    cfg.update(site=site, cookie=cookie, user_agent=ua, username=username)
     save_global(cfg)
+
+
+def cmd_accounts(args: argparse.Namespace) -> None:
+    cfg = load_global()
+    site = resolve_site(getattr(args, "oj", None), cfg)
+    active = get_account(cfg, site).get("username") or "(未知账号)"
+    saved = saved_accounts(cfg, site)
+    if not saved:
+        info(f"{account_key(site)} 尚未保存账号")
+    for name in sorted(saved):
+        print(f"{'*' if name == active else ' '} {name} @ {account_key(site)}")
+    info("切换: ./submit account <用户名>；添加: ./submit login --account <用户名>")
+
+
+def cmd_account(args: argparse.Namespace) -> None:
+    cfg = load_global()
+    site = resolve_site(args.site, cfg)
+    saved = saved_accounts(cfg, site)
+    if args.username not in saved:
+        die(f"未保存账号 {args.username}，请先: ./submit login --account {args.username}")
+    acc = saved[args.username]
+    save_account(cfg, site, acc["cookie"], acc.get("user_agent") or DEFAULT_UA,
+                 acc.get("username") or "")
+    ok(f"已切换到 {args.username} @ {account_key(site)}")
 
 
 def parse_cookie_input(raw: str) -> str:
@@ -466,7 +498,7 @@ def parse_cookie_input(raw: str) -> str:
             only = next(iter(data.values()))
             if isinstance(only, dict) and any(
                 k in only
-                for k in ("UOJSESSID", "cf_clearance", "uoj_username", "JSESSIONID")
+                for k in ("UOJSESSID", "__Host-UOJSESSID", "__Host-UOJREMEMBER", "cf_clearance", "uoj_username", "JSESSIONID")
             ):
                 data = only
         if not isinstance(data, dict):
@@ -2636,16 +2668,115 @@ def _cdp_harvest(port: int) -> Tuple[str, str, str]:
             pass
 
 
+def _read_firefox_session(path: Path) -> dict:
+    raw = path.read_bytes()
+    if len(raw) > 64 * 1024 * 1024:
+        raise ValueError("Firefox session file too large")
+    if raw.startswith(b"mozLz40\0"):
+        if len(raw) < 12:
+            raise ValueError("Truncated Firefox session")
+        size = struct.unpack("<I", raw[8:12])[0]
+        if size > 64 * 1024 * 1024:
+            raise ValueError("Firefox session too large")
+        block, out, i = raw[12:], bytearray(), 0
+
+        def length(initial: int) -> int:
+            nonlocal i
+            n = initial
+            if n == 15:
+                while True:
+                    if i >= len(block):
+                        raise ValueError("Truncated LZ4 length")
+                    v = block[i]
+                    i += 1
+                    n += v
+                    if v != 255:
+                        break
+            return n
+
+        while i < len(block):
+            token = block[i]
+            i += 1
+            n = length(token >> 4)
+            if i + n > len(block) or len(out) + n > size:
+                raise ValueError("Invalid LZ4 literals")
+            out.extend(block[i:i+n])
+            i += n
+            if i == len(block):
+                break
+            if i + 2 > len(block):
+                raise ValueError("Truncated LZ4 offset")
+            offset = block[i] | (block[i+1] << 8)
+            i += 2
+            n = length(token & 15) + 4
+            if not offset or offset > len(out) or len(out) + n > size:
+                raise ValueError("Invalid LZ4 match")
+            # Repeat the referenced bytes, including overlapping matches.
+            pattern = bytes(out[-offset:])
+            out.extend((pattern * ((n + offset - 1) // offset))[:n])
+        if len(out) != size:
+            raise ValueError("Invalid LZ4 output size")
+        raw = bytes(out)
+    result = json.loads(raw)
+    if not isinstance(result, dict):
+        raise ValueError("Invalid Firefox session object")
+    return result
+
+
+def _firefox_session_cookies(profile: Path, needles: List[str]) -> Dict[str, str]:
+    paths = [profile / rel for rel in (
+        "sessionstore-backups/recovery.jsonlz4", "sessionstore.jsonlz4",
+        "sessionstore.js", "sessionstore-backups/recovery.baklz4",
+        "sessionstore-backups/previous.jsonlz4",
+    )]
+    paths = sorted((p for p in paths if p.is_file()),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in paths:
+        try:
+            session = _read_firefox_session(path)
+        except (OSError, ValueError, UnicodeError):
+            continue
+        out: Dict[str, str] = {}
+        containers = [session] + list(session.get("windows") or [])
+        for container in containers:
+            if not isinstance(container, dict) or container.get("isPrivate"):
+                continue
+            for item in container.get("cookies") or []:
+                if not isinstance(item, dict):
+                    continue
+                host = str(item.get("host") or "").lower().lstrip(".")
+                if not any(host == n or host.endswith("." + n) for n in needles):
+                    continue
+                # Container/private cookies cannot be replayed as the default session.
+                attributes = item.get("originAttributes") or {}
+                if isinstance(attributes, dict):
+                    if any(attributes.values()):
+                        continue
+                elif attributes:
+                    continue
+                expiry = item.get("expiry", 0)
+                try:
+                    if expiry and float(expiry) < time.time():
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                if item.get("name") and item.get("value") is not None:
+                    out[str(item["name"])] = str(item["value"])
+        return out
+    return {}
+
+
 def _firefox_sqlite_cookies(profile: Path, host_needles: Optional[List[str]] = None) -> Dict[str, str]:
     src = profile / "cookies.sqlite"
-    if not src.is_file():
-        return {}
     needles = [n.lower() for n in (host_needles or ["qoj.ac"]) if n]
+    session_cookies = _firefox_session_cookies(profile, needles)
+    if not src.is_file():
+        return session_cookies
     rows: List[tuple] = []
     try:
         con = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=8)
         try:
-            rows = con.execute("SELECT host, name, value FROM moz_cookies").fetchall()
+            rows = con.execute("SELECT host, name, value FROM moz_cookies WHERE (expiry = 0 OR expiry > strftime('%s', 'now')) AND originAttributes = ''").fetchall()
         finally:
             con.close()
     except sqlite3.Error:
@@ -2665,7 +2796,7 @@ def _firefox_sqlite_cookies(profile: Path, host_needles: Optional[List[str]] = N
                     extras.append(dest)
             con = sqlite3.connect(str(tmp_path), timeout=8)
             try:
-                rows = con.execute("SELECT host, name, value FROM moz_cookies").fetchall()
+                rows = con.execute("SELECT host, name, value FROM moz_cookies WHERE (expiry = 0 OR expiry > strftime('%s', 'now')) AND originAttributes = ''").fetchall()
             finally:
                 con.close()
         except Exception:
@@ -2689,7 +2820,7 @@ def _firefox_sqlite_cookies(profile: Path, host_needles: Optional[List[str]] = N
         if not name or value is None:
             continue
         host_s = str(host or "").lower()
-        if not any(n in host_s for n in needles):
+        if not any(host_s.lstrip(".") == n or host_s.lstrip(".").endswith("." + n) for n in needles):
             continue
         host_key = host_s.lstrip(".")
         prefer = any(host_key == n or host_key.endswith("." + n) for n in needles)
@@ -2698,7 +2829,8 @@ def _firefox_sqlite_cookies(profile: Path, host_needles: Optional[List[str]] = N
         elif str(name) not in preferred:
             keep(out, str(name), str(value))
     out.update(preferred)
-    return out
+    session_cookies.update(out)
+    return session_cookies
 
 
 def _firefox_user_agent(binary: str, profile: Path) -> str:
@@ -2741,6 +2873,8 @@ def _session_ready(cookie_header: str, html: str = "", site: str = "") -> bool:
         if html and looks_logged_in(html, url=site):
             return True
         return bool(_cf_cookie_logged_in(cookie_header))
+    if (names.get("__Host-UOJSESSID") or names.get("__Host-UOJREMEMBER")) and looks_logged_in(html):
+        return True
     if names.get("UOJSESSID") and (
         names.get("uoj_username") or names.get("uoj_remember_token")
     ):
@@ -2749,6 +2883,8 @@ def _session_ready(cookie_header: str, html: str = "", site: str = "") -> bool:
 
 
 QOJ_SESSION_COOKIE_NAMES = (
+    "__Host-UOJSESSID",
+    "__Host-UOJREMEMBER",
     "UOJSESSID",
     "uoj_username",
     "uoj_remember_token",
@@ -2866,27 +3002,14 @@ def _clear_host_session_cookies(profile: Path, host: str, keep: Tuple[str, ...] 
 def _forget_saved_login(cfg: dict, site: Optional[str] = None) -> str:
     site = (site or cfg.get("site") or DEFAULT_SITE).rstrip("/")
     key = account_key(site)
-    acc = get_account(cfg, site)
-    old = str(acc.get("username") or cfg.get("username") or "")
-    accounts = cfg.get("accounts")
-    if isinstance(accounts, dict):
-        accounts.pop(key, None)
-        cfg["accounts"] = accounts
-    if account_key(cfg.get("site") or "") == key or not is_codeforces(site):
-        if not is_codeforces(site):
-            cfg["cookie"] = ""
-            cfg["username"] = ""
+    old = str(get_account(cfg, site).get("username") or "")
+    saved = saved_accounts(cfg, site)
+    saved.pop(old or "(未知账号)", None)
+    cfg.setdefault("saved_accounts", {})[key] = saved
+    cfg.setdefault("accounts", {})[key] = {}
+    if account_key(cfg.get("site") or DEFAULT_SITE) == key:
+        cfg.update(cookie="", username="", user_agent="")
     save_global(cfg)
-    _kill_stale_login_browsers()
-    host = key or "qoj.ac"
-    if is_codeforces(site):
-        _clear_host_session_cookies(_firefox_profile_dir(), host)
-        _clear_host_session_cookies(
-            Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile", host
-        )
-    else:
-        _clear_qoj_session_cookies(_firefox_profile_dir())
-        _clear_qoj_session_cookies(Path.home() / ".local" / "share" / "qoj-xcpc" / "chromium-profile")
     return old
 
 
@@ -3060,7 +3183,7 @@ def _firefox_default_profile(binary: str = "", host: str = "") -> Optional[Path]
             score += 2
         if names.get("cf_clearance"):
             score += 1
-        if names.get("UOJSESSID") or names.get("uoj_username") or names.get("uoj_remember_token"):
+        if any(names.get(n) for n in QOJ_SESSION_COOKIE_NAMES):
             score += 3
         if score > best_score:
             best_score = score
@@ -3262,10 +3385,23 @@ def _start_real_browser(
     return proc, log_path
 
 
-def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
+def _account_browser_profile(kind: str, site: str, username: str) -> Path:
+    # Hash path components: usernames and custom hosts may contain slashes.
+    ident = hashlib.sha256((account_key(site) + "\0" + username).encode()).hexdigest()[:24]
+    snap_common = Path.home() / "snap" / "firefox" / "common"
+    if kind == "firefox" and snap_common.is_dir():
+        root = snap_common
+    else:
+        root = Path.home() / ".local" / "share" / "qoj-xcpc"
+    return root / f"qoj-submit-profile-{kind}-{ident}"
+
+
+def _login_real_browser(site: str, expected: str = "") -> Optional[Tuple[str, str, str]]:
     if not _linux_display_ok():
         warn("当前没有图形界面。请在虚拟机桌面终端运行 python3 submit login")
         return None
+    if expected:
+        info(f"目标账号: {expected}。使用独立浏览器配置，避免退出其他账号的会话")
     binaries = _browser_binaries()
     if not binaries:
         warn("没有找到 firefox / chromium / chrome，请先: sudo apt install firefox")
@@ -3285,7 +3421,9 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
         for kind, binary in binaries:
             port = _free_port()
             isolated = True
-            if kind == "firefox":
+            if expected:
+                profile = _account_browser_profile(kind, site, expected)
+            elif kind == "firefox":
                 default_profile = _firefox_default_profile(binary, host)
                 if default_profile:
                     profile = default_profile
@@ -3300,9 +3438,11 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
             info(f"正在打开普通 {kind}")
             info(f"  程序: {binary}")
             info(f"  配置: {profile}")
+            if expected:
+                info("请在这个账号的独立窗口里完成验证并登录；成功后会自动保存")
             if is_codeforces(site):
-                info("会用你平时的 Firefox 打开 Codeforces。请在窗口里完成 Cloudflare，再点右上角 Enter 登录")
-                info("不要关那个窗口，登录成功后脚本会自动继续（不会关掉你的 Firefox）")
+                info("请在窗口里完成 Cloudflare，再点右上角 Enter 登录")
+                info("不要关那个窗口，登录成功后脚本会自动继续")
                 try:
                     import curl_cffi  # noqa: F401
                 except ImportError:
@@ -3311,8 +3451,9 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
                         + _curl_cffi_install_hint()
                     )
             else:
-                info("会用你平时的 Firefox 打开站点首页。已登录则直接读取，否则请在窗口里登录")
-                info("不要关那个窗口，登录成功后脚本会自动继续（不会关掉你的 Firefox）")
+                if not expected:
+                    info("会用你平时的 Firefox 打开站点首页。已登录则直接读取，否则请在窗口里登录")
+                info("不要关那个窗口，登录成功后脚本会自动继续")
             try:
                 proc, log_path = _start_real_browser(
                     kind, binary, site, profile, port, extra_url=sniff_url, isolated=isolated
@@ -3368,10 +3509,12 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
                                 html = ""
                         except Exception:
                             html = ""
-                    if is_codeforces(site) and _cf_cookie_logged_in(cookie):
+                    if is_codeforces(site) and _cf_cookie_logged_in(cookie) and not expected:
                         ok(f"已检测到登录 ({account_key(site) or site})")
                         return cookie, ua, html
                     ready = bool(cookie) and _session_ready(cookie, html, site=site)
+                    if expected:
+                        ready = ready and extract_username(html) == expected
                     if ready:
                         last_cookie, last_ua, last_html = cookie, ua, html or last_html
                         ok(f"已检测到登录 ({account_key(site) or site})")
@@ -3388,13 +3531,13 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
                                 info("已读到 Cookie，但还没有登录态。请在窗口右上角点 Enter 登录")
                             else:
                                 info("已读到登录 Cookie，正在确认…")
-                        elif not names.get("UOJSESSID"):
+                        elif not (names.get("UOJSESSID") or names.get("__Host-UOJSESSID") or names.get("__Host-UOJREMEMBER")):
                             info("还没读到登录态。请在窗口里登录（含 Cloudflare）")
                         else:
                             info("已读到 Cookie，正在确认…")
                         last_hint = now
                     time.sleep(1.2)
-                if _session_ready(last_cookie, last_html, site=site):
+                if _session_ready(last_cookie, last_html, site=site) and (not expected or extract_username(last_html) == expected):
                     return last_cookie, last_ua, last_html
             finally:
                 if not keep_browser:
@@ -3410,15 +3553,15 @@ def _login_real_browser(site: str) -> Optional[Tuple[str, str, str]]:
     return None
 
 
-def login_via_browser(site: str) -> Tuple[str, str, str]:
-    got = _login_real_browser(site)
+def login_via_browser(site: str, expected: str = "") -> Tuple[str, str, str]:
+    got = _login_real_browser(site, expected)
     if got:
         cookie, ua, html = got
         if is_codeforces(site):
             if looks_logged_in(html, url=site) or _cf_cookie_logged_in(cookie):
                 info("已用普通浏览器完成登录")
                 return cookie, ua, html
-        elif cookie_names(cookie).get("UOJSESSID") or looks_logged_in(html):
+        elif _session_ready(cookie, html, site=site):
             info("已用普通浏览器完成登录")
             return cookie, ua, html
     hint = "python3 submit login cf" if is_codeforces(site) else "python3 submit login"
@@ -3437,6 +3580,7 @@ def _finalize_login(
     ua: str,
     debug: bool,
     fallback_user: str = "",
+    expected: str = "",
 ) -> None:
     cookie = parse_cookie_input(cookie)
     names = cookie_names(cookie)
@@ -3471,6 +3615,8 @@ def _finalize_login(
             username = _cf_handle_from_firefox_profile(
                 _firefox_default_profile("", "codeforces.com")
             )
+        if expected and username != expected:
+            die(f"实际登录账号是 {username or '(未知)'}，与目标 {expected} 不符；未保存")
         save_account(cfg, site, client.cookie_header() or cookie, ua, username)
         ok(f"已登录 {username or '(未知用户)'} @ {site}")
         info(f"配置保存在 {global_config_path()}")
@@ -3485,7 +3631,11 @@ def _finalize_login(
                 "浏览器里看起来已经登录，但命令行请求仍未带上会话。\n"
                 "请再试一次 ./submit login，或确认弹出的窗口里确实登录成功。"
             )
-    username = extract_username(page) or expect or get_account(cfg, site).get("username") or ""
+    username = extract_username(page) or expect or ""
+    if expected and username != expected:
+        die(f"实际登录账号是 {username or '(未知)'}，与目标 {expected} 不符；未保存")
+    if not username:
+        die("未能识别登录账号，未保存会话；请检查网页导航栏")
     save_account(cfg, site, client.cookie_header() or cookie, ua, username)
     ok(f"已登录 {username or '(未知用户)'} @ {site}")
     info(f"配置保存在 {global_config_path()}")
@@ -3549,6 +3699,7 @@ def cmd_login(args: argparse.Namespace) -> None:
         site = (cfg.get("site") or DEFAULT_SITE).rstrip("/")
     info(f"登录 {oj_label(site)}  ({site})")
     ua = args.user_agent or get_account(cfg, site).get("user_agent") or cfg.get("user_agent") or DEFAULT_UA
+    expected = getattr(args, "account", None) or ""
     cookie = args.cookie
     if args.cookie_file:
         cookie = Path(args.cookie_file).read_text(encoding="utf-8").strip()
@@ -3558,14 +3709,14 @@ def cmd_login(args: argparse.Namespace) -> None:
         prev = get_account(cfg, site).get("username") or ""
         if prev:
             info(f"本地 {account_key(site)} 记录是 {prev}，将读取浏览器当前登录")
-        cookie, ua, html = login_via_browser(site)
+        cookie, ua, html = login_via_browser(site, expected)
         fallback = (
             extract_cf_handle(html)
             or extract_username(html)
             or cookie_names(cookie).get("uoj_username")
             or ""
         )
-        _finalize_login(cfg, site, cookie, ua, args.debug, fallback_user=fallback)
+        _finalize_login(cfg, site, cookie, ua, args.debug, fallback_user=fallback, expected=expected)
         return
 
     if not cookie and not args.username:
@@ -3582,7 +3733,7 @@ def cmd_login(args: argparse.Namespace) -> None:
                 "Cookie 里有 cf_clearance，但 User-Agent 还是脚本默认值。\n"
                 "请粘贴同一浏览器的 User-Agent，或加上 --user-agent"
             )
-        if not is_codeforces(site) and "UOJSESSID" not in names and "uoj_remember_token" not in names:
+        if not is_codeforces(site) and not any(names.get(n) for n in QOJ_SESSION_COOKIE_NAMES):
             warn("没有看到 UOJSESSID / uoj_remember_token，登录可能失败")
         if is_codeforces(site) and "JSESSIONID" not in names:
             die(
@@ -3597,6 +3748,7 @@ def cmd_login(args: argparse.Namespace) -> None:
             ua,
             args.debug,
             fallback_user=names.get("uoj_username") or "",
+            expected=expected,
         )
         return
 
@@ -3633,13 +3785,9 @@ def cmd_login(args: argparse.Namespace) -> None:
         )
     status, url, home = client.get("/")
     handle = extract_username(home) or username
-    cfg.update({
-        "site": site,
-        "cookie": client.cookie_header(),
-        "user_agent": ua,
-        "username": handle,
-    })
-    save_global(cfg)
+    if expected and handle != expected:
+        die(f"实际登录账号 {handle} 与目标 {expected} 不符；未保存")
+    save_account(cfg, site, client.cookie_header(), ua, handle)
     ok(f"已登录 {handle} @ {site}")
     info(f"配置保存在 {global_config_path()}")
 
@@ -4838,6 +4986,12 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("-p", "--password", default=None)
     pl.add_argument("--manual", action="store_true", help="改用手动粘贴 Cookie")
     pl.add_argument("--browser", action="store_true", help="强制弹出浏览器窗口登录")
+    pl.add_argument("--account", default=None, help="目标用户名；使用独立浏览器配置保存该账号")
+    pa = sub.add_parser("accounts", help="列出当前站点保存的账号（* 为当前账号）")
+    pa.add_argument("oj", nargs="?", default=None, help="qoj / cf / 站点")
+    pac = sub.add_parser("account", help="切换已保存的账号")
+    pac.add_argument("username")
+    pac.add_argument("--site", default=None, help="qoj / cf / 站点")
 
     po = sub.add_parser("logout", help="退出本地登录，以便换账号")
     po.add_argument("oj", nargs="?", default=None, help="qoj 或 cf")
@@ -4870,7 +5024,7 @@ def looks_like_submit_target(arg: str) -> bool:
         return False
     commands = {
         "login", "logout", "init", "contest", "problems", "list", "status",
-        "watch", "whoami", "help", "cf", "codeforces", "gym", "qoj", "oj",
+        "watch", "whoami", "accounts", "account", "help", "cf", "codeforces", "gym", "qoj", "oj",
     }
     if arg in commands:
         return False
@@ -4968,6 +5122,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.cmd == "login":
         args.debug = debug
         cmd_login(args)
+    elif args.cmd == "accounts":
+        cmd_accounts(args)
+    elif args.cmd == "account":
+        cmd_account(args)
     elif args.cmd == "logout":
         cmd_logout(args)
     elif args.cmd == "whoami":

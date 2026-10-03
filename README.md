@@ -41,13 +41,45 @@ python3 submit login
 python3 submit whoami
 ```
 
-会弹出**你平时的 Firefox**，直接打开对应 OJ 首页。窗口里已经登录则立刻读取当前账号；否则请在窗口里登录（含 Cloudflare）。Codeforces 过验证后点右上角 Enter。
+默认会弹出**你平时的 Firefox**，直接打开对应 OJ 首页。窗口里已经登录则立刻读取当前账号；否则请在窗口里登录（含 Cloudflare）。Codeforces 过验证后点右上角 Enter。
 
 Cookie 和 User-Agent 保存在 `~/.config/qoj-xcpc/config.json`，各 OJ 分开存，不要提交到 git。Cookie 过期后重新 `login`。
 
-换账号：在浏览器里退出后，再 `python3 submit login`。`python3 submit logout` 只清本地保存的登录。
+换账号：在浏览器里退出后，再 `python3 submit login`。`python3 submit logout` 只删除当前账号的本地记录，保留其它已保存账号，不清理浏览器 Cookie。
 
 指定站点登录：`python3 submit login cf`。
+
+### 多账号登录和切换
+
+同一个 OJ 可以保存多个账号。指定 `--account` 时，会使用该站点、该用户名
+独立的浏览器配置，避免为了换号退出网页而使另一个账号的会话失效。
+首次登录请在弹出的窗口完成验证，并登录对应用户名；脚本会核对实际账号。
+
+```bash
+./submit login qoj --account alice
+./submit login qoj --account team_account
+./submit accounts qoj                         # * 标记当前账号
+./submit account alice --site qoj              # 切换保存的会话
+./submit whoami --check                        # 联网验证
+./submit a.cpp                                # 使用当前账号提交
+
+./submit login cf --account cf_handle
+./submit account cf_handle --site cf
+```
+
+`accounts` 和 `account` 默认使用当前选择的 OJ。切换账号会同时切换 Cookie
+和 User-Agent，不改变比赛绑定；提交、`status` 和 `watch` 使用比赛所属站点
+当前选中的账号。默认 `login` 仍读取日常 Firefox 的当前账号。
+也可通过 `login --manual --account 用户名` 导入浏览器 Cookie。
+
+旧的单账号配置会在保存或切换时保留。`accounts[站点]` 继续保存当前账号，
+新增 `saved_accounts[站点][用户名]` 保存其它会话。`logout [qoj|cf]` 只删除
+该站点当前账号的本地记录，其它账号仍可切换；网页退出或服务器会话过期
+后，需要重新登录该账号。
+
+QOJ 登录同时支持旧版 Cookie 和 `__Host-UOJSESSID` / `__Host-UOJREMEMBER`。
+Firefox 会话 Cookie 从最新的 sessionstore/recovery 文件读取，Mozilla LZ4
+解压无需额外依赖；新版 Cookie 必须经过网页登录状态确认。
 
 ### 2. 绑定比赛
 

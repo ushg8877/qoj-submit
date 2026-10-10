@@ -20,3 +20,5 @@ submission/
 *.py
 !install.sh
 !test_submit.py
+!test_problem_standings.py
+!test_browser_accounts.py

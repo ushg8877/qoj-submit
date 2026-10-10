@@ -41,11 +41,13 @@ python3 submit login
 python3 submit whoami
 ```
 
-会弹出**你平时的 Firefox**，直接打开对应 OJ 首页。窗口里已经登录则立刻读取当前账号；否则请在窗口里登录（含 Cloudflare）。Codeforces 过验证后点右上角 Enter。
+会弹出使用**独立配置的 Firefox / Chromium**，直接打开对应 OJ。默认每次登录使用新的会话，直接在窗口里登录（含 Cloudflare），无需退出日常浏览器里的账号。Codeforces 过验证后点右上角 Enter。登录完成后临时窗口关闭，Cookie 保存供命令行使用。
 
 Cookie 和 User-Agent 保存在 `~/.config/qoj-xcpc/config.json`，各 OJ 分开存，不要提交到 git。Cookie 过期后重新 `login`。
 
-换账号：在浏览器里退出后，再 `python3 submit login`。`python3 submit logout` 只清本地保存的登录。
+添加账号可用 `python3 submit login --account alice`、`python3 submit login --account bob`，分别使用按站点和用户名隔离的持久浏览器配置。`python3 submit accounts` 查看已保存账号，`python3 submit account alice` 切换命令行使用的凭证，无需在浏览器退出任何账号。不指定 `--account` 的登录也会保存到识别出的用户名下，并保留其他账号凭证。
+
+`python3 submit logout` 只清本地当前登录。若旧 Cookie 已因网页退出登录而被服务器作废，需要在独立配置中重新登录对应账号；本地保存 Cookie 不能恢复已失效的服务器会话。
 
 指定站点登录：`python3 submit login cf`。
 
@@ -94,11 +96,17 @@ Cookie 和 User-Agent 保存在 `~/.config/qoj-xcpc/config.json`，各 OJ 分开
 
 ### 其它命令
 
+`problems`（别名 `list`）在 QOJ ICPC 比赛中实时读取榜单，显示当前账号的 `Status` 和每题通过队伍数 `Solved`。未提交状态留空；通过为 `+(首次通过前的罚时次数)`，未通过为 `-(当前计罚次数)`，首次无罚时通过显示 `+(0)`。待评测或封榜状态显示 `?(数量)`，通过队伍数以当前可见榜单为准。
+
+`--sort-by-solved` 按通过数降序排列，同数按题号排列。榜单读取失败会提示原因，状态和通过数显示 `?`；此时请求排序会报错。`--offline` 只显示本地列表，不能同时排序。Codeforces 保留原题目列表，新增统计目前仅支持 QOJ ICPC 榜单。
+
 ```bash
 ./submit oj           # 当前 OJ
 ./submit qoj          # 选择 QOJ
 ./submit cf           # 选择 Codeforces
-./submit problems     # 题目列表
+./submit problems     # 题目列表、状态和通过队伍数
+./submit problems --sort-by-solved # 按通过队伍数降序
+./submit problems --offline # 只读取本地题目列表
 ./submit status       # 自己在本场的全部提交（自动翻页）
 ./submit status -n 20 # 只显示最近 20 条
 ./submit whoami       # 立即显示本地账号（不联网）
